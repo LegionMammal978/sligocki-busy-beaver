@@ -20,7 +20,7 @@ pub struct RepBlock {
 }
 
 #[derive(Debug, Clone)]
-pub struct HalfTape(Vec<RepBlock>);
+pub struct HalfTape(pub(crate) Vec<RepBlock>);
 
 pub type Tape = EnumMap<Dir, HalfTape>;
 
@@ -90,7 +90,8 @@ impl HalfTape {
     pub fn push_symbol(&mut self, symbol: Symbol) {
         // Keep this simple. Always push symbols as their own simple block.
         // If this was a simulator, we'd prefer to merge symbols into existing blocks.
-        // But since the use case is for validation, we want to keep the code as simple as possible.
+        // But since the use case is for validation, we want to keep the code as simple
+        // as possible.
         self.0.push(RepBlock {
             symbols: vec![symbol],
             rep: 1.into(),
@@ -123,7 +124,8 @@ impl HalfTape {
     }
 
     // Pop the top symbol from this half-tape if possible.
-    // Returns None if the tape is empty or if the top symbol is ambiguous (based on variable assignments).
+    // Returns None if the tape is empty or if the top symbol is ambiguous (based on
+    // variable assignments).
     pub fn pop_symbol(&mut self) -> Option<Symbol> {
         *self = self.normalize();
         match &mut self.0[..] {
@@ -176,7 +178,7 @@ impl HalfTape {
 
     // Return a normalized version of this tape.
     // Removes empty blocks and merges adjacent blocks with the same symbols.
-    fn normalize(&self) -> Self {
+    pub(crate) fn normalize(&self) -> Self {
         let mut new_blocks: Vec<RepBlock> = vec![];
         for block in &self.0 {
             // Strip out empty blocks.
@@ -193,6 +195,55 @@ impl HalfTape {
             }
         }
         HalfTape(new_blocks)
+    }
+
+    // Try to expand the top block by popping symbols from below.
+    pub(crate) fn expand_top(&mut self, symbols: &[Symbol]) -> Option<()> {
+        // Create a new half-tape without the top block.
+        // If the actual top block doesn't match, we create a new block.
+        let mut new_tape = self.clone();
+        let mut top = if &new_tape.0.last().unwrap().symbols == symbols {
+            new_tape.0.pop().unwrap()
+        } else {
+            RepBlock {
+                symbols: symbols.to_vec(),
+                rep: 0.into(),
+            }
+        };
+
+        // Pop symbols from below, and verify that they match the top block.
+        for i in 0..symbols.len() {
+            // If the next block matches the top block exactly, rotate it upward.
+            let j = symbols.len() - i;
+            let next_block = new_tape.0.last()?;
+            if next_block.symbols.len() == symbols.len()
+                && next_block.symbols[..i] == symbols[j..]
+                && next_block.symbols[i..] == symbols[..j]
+            {
+                let next_block = new_tape.0.pop().unwrap();
+                new_tape.0.push(RepBlock {
+                    symbols: symbols[j..].to_vec(),
+                    rep: 1.into(),
+                });
+
+                // Expand the top block and add it back to the half-tape.
+                top.rep = top.rep.checked_add(&next_block.rep)?;
+                new_tape.0.push(top);
+                *self = new_tape.normalize();
+                return Some(());
+            }
+
+            // Otherwise, pop a symbol and try again.
+            if new_tape.pop_symbol() != Some(symbols[j - 1]) {
+                return None;
+            }
+        }
+
+        // Expand the top block and add it back to the half-tape.
+        top.rep = top.rep.checked_add(&1.into())?;
+        new_tape.0.push(top);
+        *self = new_tape.normalize();
+        Some(())
     }
 
     // Try to replace a subset of this tape.
@@ -221,39 +272,22 @@ impl HalfTape {
                         curr_top.rep = diff;
                     }
                     continue;
-                } else {
-                    return Err(format!(
-                        "Tapes differ: {} vs. {}",
-                        curr_top.to_string(Dir::Right),
-                        sub_top.to_string(Dir::Right)
-                    ));
                 }
             }
 
-            match (curr.pop_symbol(), sub.pop_symbol()) {
-                (Some(l), Some(r)) => {
-                    if l != r {
-                        return Err(format!("Tapes differ: {} != {}", l, r));
-                    }
-                }
-                (curr_top_1, sub_top_1) => {
-                    // If either pop_symbol() failed, we cannot compare the tapes.
-                    // Unfortunately, we cannot even print the tapes at this point since it's possible
-                    // that one has had a symbol popped and the other not. When testing you can uncomment
-                    // the println!() above to see the tapes before the pops.
-                    return Err(format!(
-                        "Tapes differ: {:?} {} vs. {:?} {}",
-                        curr_top_1,
-                        curr.to_string(Dir::Right),
-                        sub_top_1,
-                        sub.to_string(Dir::Right)
-                    ));
-                }
-            }
+            // Otherwise, try expanding the `curr` top block to match.
+            curr.expand_top(&sub_top.symbols).ok_or_else(|| {
+                format!(
+                    "Tapes differ: {} vs. {}",
+                    curr.to_string(Dir::Right),
+                    sub.to_string(Dir::Right)
+                )
+            })?;
         }
         // sub.0.is_empty()
-        // Success, we have removed `old` from the front of `curr`. Now replace it with `new`.
-        // Note: The order here is that `new` is closest to the TM head which is stored at the end of the Vec.
+        // Success, we have removed `old` from the front of `curr`. Now replace it with
+        // `new`. Note: The order here is that `new` is closest to the TM head
+        // which is stored at the end of the Vec.
         Ok(HalfTape(
             curr.0
                 .iter()
@@ -319,8 +353,9 @@ impl Config {
     }
 
     // Advance the TM by one step.
-    // Returns an error if the TM is in a halt/undefined state or if it fell off the tape.
-    pub fn step(&mut self, tm: &TM) -> Result<(), String> {
+    // Returns an error if the TM is in a halt/undefined state or if it fell off the
+    // tape.
+    pub fn step(&mut self, tm: &TM) -> Result<(crate::tm::RunState, Symbol), String> {
         let read_symbol = self
             .front_tape()
             .pop_symbol()
@@ -331,7 +366,7 @@ impl Config {
                 self.state = state;
                 // We write the symbol before moving (so it goes behind us).
                 self.back_tape().push_symbol(symbol);
-                Ok(())
+                Ok((state_in, read_symbol))
             } else {
                 Err("Undefined transition".to_string())
             }

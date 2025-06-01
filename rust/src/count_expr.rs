@@ -12,14 +12,14 @@ pub struct Variable(usize);
 pub const VAR_N: Variable = Variable(0);
 
 #[derive(Debug, Clone)]
-pub struct VarSubst(HashMap<Variable, CountExpr>);
+pub struct VarSubst(pub(crate) HashMap<Variable, CountExpr>);
 
 // Simple algebraic expression which is just a sum of variables and constants.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct VarSum {
     // Implementation detail: {x: 2, y: 1}  -->  2x + y
-    var_counts: BTreeMap<Variable, CountType>,
-    constant: CountType,
+    pub(crate) var_counts: BTreeMap<Variable, CountType>,
+    pub(crate) constant: CountType,
 }
 
 // Function is represented by `bound_var` and `expr`.
@@ -294,8 +294,8 @@ impl Function {
     }
 
     fn known_equal(&self, other: &Function) -> bool {
-        // Support alpha equivalence (two functions being equal up to renaming of bound variables).
-        // TODO: unwrap ...
+        // Support alpha equivalence (two functions being equal up to renaming of bound
+        // variables). TODO: unwrap ...
         let other_renamed = other
             .expr
             .subst(&VarSubst::single(other.bound_var, self.bound_var.into()))

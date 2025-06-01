@@ -4,7 +4,7 @@ use std::result::Result;
 
 use crate::base::CountType;
 use crate::config::Config;
-use crate::count_expr::{CountExpr, VarSubst, VarSubstError, Variable, VAR_N};
+use crate::count_expr::{CountExpr, Function, VarSubst, VarSubstError, Variable, VAR_N};
 use crate::tm::TM;
 
 use thiserror::Error;
@@ -37,6 +37,11 @@ pub enum Proof {
         // var: Variable,
         proof_base: Vec<ProofStep>,
         proof_inductive: Vec<ProofStep>,
+    },
+    // A proof splitting a variable into different cases modulo `proof_cases.len()`.
+    ModularCases {
+        var: Variable,
+        proof_cases: Vec<Vec<ProofStep>>,
     },
 }
 
@@ -99,6 +104,11 @@ enum RuleValidationError {
     // Failure in a Proof::Inductive proof_inductive.
     #[error("Induction: {0}")]
     Induction(ProofValidationError),
+    #[error("No modular cases are defined")]
+    NoModularCases,
+    // Failure in a Proof::ModularCases proof_case.
+    #[error("Case {0}: {1}")]
+    ModularCase(usize, ProofValidationError),
 }
 
 #[allow(dead_code)]
@@ -240,6 +250,30 @@ fn validate_rule(tm: &TM, rule: &Rule, prev_rules: &[Rule]) -> Result<(), RuleVa
             )
             .map_err(RuleValidationError::Induction)
         }
+        Proof::ModularCases { var, proof_cases } => {
+            if proof_cases.is_empty() {
+                return Err(RuleValidationError::NoModularCases);
+            }
+            let var_expr = CountExpr::var_plus(*var, 0);
+            let modulus = proof_cases.len().try_into().unwrap();
+
+            for (i, proof) in proof_cases.iter().enumerate() {
+                // Validate the i'th modular case (var <- modulus*var+i).
+                let f = Function::affine(modulus, i.try_into().unwrap());
+                let case_subst = VarSubst::single(*var, f.apply(var_expr.clone()));
+                validate_proof(
+                    tm,
+                    rule.init_config.subst(&case_subst).unwrap(),
+                    proof,
+                    rule.final_config.subst(&case_subst).unwrap(),
+                    prev_rules,
+                    None,
+                )
+                .map_err(|err| RuleValidationError::ModularCase(i, err))?;
+            }
+
+            Ok(())
+        }
     }
 }
 
@@ -257,7 +291,7 @@ fn validate_rule_set(rule_set: &RuleSet) -> Result<(), ValidationError> {
 mod tests {
     use std::{str::FromStr, vec};
 
-    use crate::count_expr::{Function, RecursiveExpr, VarSum};
+    use crate::count_expr::{Function, RecursiveExpr};
 
     use super::*;
 
@@ -3481,6 +3515,4473 @@ mod tests {
                             )]),
                         },
                         // 0^inf 1^2b+2 <D 1^2a+2 0^inf
+                    ]),
+                },
+            ],
+        };
+        if let Err(err) = validate_rule_set(&rule_set) {
+            panic!("{}", err);
+        }
+    }
+
+    #[test]
+    fn test_62_1() {
+        // 1RB0LB_0LC0RB_0RE1LD_1LA---_1RF0RF_0RA0LE
+        // 0^inf D> 0^inf = 1RB---_1LC0RC_0RD0LC_0LE1RA_1LF0LF_0LB0RE
+        // 0^inf E> 0^inf = 1RB0RB_0RC0LA_1RD0LD_0LE0RD_0RA1LF_1LC---
+        // Let A(a, b, c) = 0^inf 1100101 B> 10^4a+4 0 10^4b+2 001100 10^c+34 0^inf
+        // Let B(a, b, c) = 0^inf 1100101 B> 10^4a+4 0 10^2b+34 0 10^2 0 10^c+1 0^inf
+
+        fn a(a: &str, b: &str, c: &str) -> Config {
+            Config::from_str("0^inf 1100101 B> 10^4a+4 0 10^4b+2 001100 10^c+34 0^inf")
+                .unwrap()
+                .subst(&load_vars(&[("a", a), ("b", b), ("c", c)]))
+                .unwrap()
+        }
+        fn b(a: &str, b: &str, c: &str) -> Config {
+            Config::from_str("0^inf 1100101 B> 10^4a+4 0 10^2b+34 0 10^2 0 10^c+1 0^inf")
+                .unwrap()
+                .subst(&load_vars(&[("a", a), ("b", b), ("c", c)]))
+                .unwrap()
+        }
+
+        #[rustfmt::skip]
+        let rule_set = RuleSet {
+            tm: TM::from_str("1RB0LB_0LC0RB_0RE1LD_1LA---_1RF0RF_0RA0LE").unwrap(),
+            rules: vec![
+                chain_rule("B> 10^2n", "0001^n B>", 8),                  // 0
+                chain_rule("0001^n 010 <B 0", "010 <B 0 10^2n", 66),     // 1
+                chain_rule("0001^n 01010 <B 0", "01010 <B 0 10^2n", 72), // 2
+                // 3: B> 10^a+2 0^inf  -->  01010 <B 0 10^a+1 0^inf
+                Rule {
+                    init_config: Config::from_str("B> 10^a+2 0^inf").unwrap(),
+                    final_config: Config::from_str("01010 <B 0 10^a+1 0^inf").unwrap(),
+                    proof: Proof::ModularCases {
+                        var: "a".parse().unwrap(),
+                        proof_cases: vec![
+                            vec![
+                                // B> 10^2a+2 0^inf
+                                chain_step(0, "a+1"),
+                                base_step(20),
+                                // 0001^a 01010 <B 01 0^inf
+                                chain_step(2, "a"),
+                                // 01010 <B 0 10^2a+1 0^inf
+                            ],
+                            vec![
+                                // B> 10^2a+3 0^inf
+                                chain_step(0, "a+1"),
+                                base_step(78),
+                                // 0001^a 01010 <B 0 10^2 0^inf
+                                chain_step(2, "a"),
+                                // 01010 <B 0 10^2a+2 0^inf
+                            ],
+                        ],
+                    },
+                },
+                // 4: 010 B> 10^2a+3 01  -->  011100101 B> 10^2a+1
+                Rule {
+                    init_config: Config::from_str("010 B> 10^2a+3 01").unwrap(),
+                    final_config: Config::from_str("011100101 B> 10^2a+1").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 010 B> 10^2a+3 01
+                        chain_step(0, "a+1"),
+                        base_step(6),
+                        // 010 0001^a+1 010 <B 0
+                        chain_step(1, "a+1"),
+                        base_step(22),
+                        // 011100101 B> 10^2a+1
+                    ]),
+                },
+                // 5: 011100101 B> 10^2a+1 01  -->  1100101 B> 10^2a+3
+                Rule {
+                    init_config: Config::from_str("011100101 B> 10^2a+1 01").unwrap(),
+                    final_config: Config::from_str("1100101 B> 10^2a+3").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 011100101 B> 10^2a+1 01
+                        chain_step(0, "a"),
+                        base_step(6),
+                        // 011100101 0001^a 010 <B 0
+                        chain_step(1, "a"),
+                        base_step(146),
+                        // 1100101 B> 10^2a+3
+                    ]),
+                },
+                // 6: 00011100101 B> 10^2a+1 01  -->  001100101 B> 10^2a+3
+                Rule {
+                    init_config: Config::from_str("00011100101 B> 10^2a+1 01").unwrap(),
+                    final_config: Config::from_str("001100101 B> 10^2a+3").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 00011100101 B> 10^2a+1 01
+                        chain_step(0, "a"),
+                        base_step(6),
+                        // 00011100101 0001^a 010 <B 0
+                        chain_step(1, "a"),
+                        base_step(146),
+                        // 001100101 B> 10^2a+3
+                    ]),
+                },
+                // 7: 001100101 B> 10^2a+1 01  -->  010 <B 0100 10^2a+3
+                Rule {
+                    init_config: Config::from_str("001100101 B> 10^2a+1 01").unwrap(),
+                    final_config: Config::from_str("010 <B 0100 10^2a+3").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 001100101 B> 10^2a+1 01
+                        chain_step(0, "a"),
+                        base_step(6),
+                        // 001100101 0001^a 010 <B 0
+                        chain_step(1, "a"),
+                        base_step(107),
+                        // 010 <B 0100 10^2a+3
+                    ]),
+                },
+                // 8: 0^inf 1100101 B> 10^a+2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^a 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^a+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^a 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^a+2 0^inf
+                        rule_step(3, &[("a", "a")]),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^a 0^inf
+                    ]),
+                },
+                // 9: 0^inf 1100101 B> 10^2a+2 0 10^b+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^b+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^b+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^b+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^b+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^b+2 0^inf
+                        rule_step(3, &[("a", "b")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^b+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^b+1 0^inf
+                    ]),
+                },
+                // 10: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^c+4n  -->  0^inf 1100101 B> 10^2a+4n+4 0 10^2b+4n+2 0 10^c
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^c+4n").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+4n+4 0 10^2b+4n+2 0 10^c").unwrap(),
+                    proof: Proof::Inductive {
+                        proof_base: vec![],
+                        proof_inductive: vec![
+                            // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^c+4n+4
+                            chain_step(0, "a+2"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0 10^c+4n+4
+                            rule_step(4, &[("a", "b")]),
+                            rule_step(5, &[("a", "b")]),
+                            rule_step(6, &[("a", "b+1")]),
+                            rule_step(7, &[("a", "b+2")]),
+                            // 0^inf 1100101 0001^a 010 <B 0100 10^2b+7 0 10^c+4n
+                            chain_step(1, "a"),
+                            base_step(186),
+                            // 0^inf 1100101 B> 10^2a+5 0 10^2b+7 0 10^c+4n
+                            chain_step(0, "a+2"),
+                            base_step(6),
+                            // 0^inf 1100101 0001^a+2 010 <B 00 10^2b+6 0 10^c+4n
+                            chain_step(1, "a+2"),
+                            base_step(186),
+                            // 0^inf 1100101 B> 10^2a+8 0 10^2b+6 0 10^c+4n
+                            induction_step(&[("a", "a+2"), ("b", "b+2"), ("c", "c")]),
+                            // 0^inf 1100101 B> 10^2a+4n+8 0 10^2b+4n+6 0 10^c
+                        ],
+                    },
+                },
+                // 11: 0^inf 1100101 B> 10^2a+2 0 10^2b+2 0 10^2 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+2 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+2 0 10^2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+2 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+2 0 10^2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+3 0 10^2 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+3 0^inf
+                        rule_step(3, &[("a", "2b+1")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+2 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+2 0^inf
+                    ]),
+                },
+                // 12: 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^c+2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+c+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^c+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+c+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^c+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 1100 10^c+2 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^c+3 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+c+2 0^inf
+                        rule_step(3, &[("a", "2b+c")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+c+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+c+1 0^inf
+                    ]),
+                },
+                // 13: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c 1100 10^d+2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c 1100 10^d+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c 1100 10^d+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 0 10^2c 1100 10^d+2 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 B> 10^2c+1 1100 10^d+2 0^inf
+                        chain_step(0, "c"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 <B 0 10^d+3 0^inf
+                        chain_step(1, "c"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 B> 10^2c+d+2 0^inf
+                        rule_step(3, &[("a", "2c+d")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 0 10^2 01100 10^2c+d+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b+2 01100 10^2c+d+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+d+1 0^inf
+                    ]),
+                },
+                // 14: 0^inf 1100101 B> 10^2a+2 0 10^2b 001100 10^c+3 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^3 0 10^c+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 001100 10^c+3 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^3 0 10^c+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 001100 10^c+3 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 001100 10^c+3 0^inf
+                        chain_step(0, "b"),
+                        base_step(24),
+                        // 0^inf 1100101 0001^a 010 0001^b 0101100101 B> 10^c+2 0^inf
+                        rule_step(3, &[("a", "c")]),
+                        base_step(234),
+                        // 0^inf 1100101 0001^a 010 0001^b 11001010001010 B> 10^c+2 0^inf
+                        rule_step(3, &[("a", "c")]),
+                        base_step(120),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2 01100 10^3 0 10^c+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 01100 10^3 0 10^c+1 0^inf
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^3 0 10^c+1 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(26),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 0100001010 B> 10^c+2 0^inf
+                        rule_step(3, &[("a", "c")]),
+                        base_step(90),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0100 10^3 0 10^c+1 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+3 0 10^3 0 10^c+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^3 0 10^c+1 0^inf
+                    ]),
+                },
+                // 15: 0^inf 1100101 B> 10^2a+4 0 10^2b 1100 10^2c+1 0 10^2 1  -->  0^inf 1100101 B> 10^2a+8 0 10^2b+2c+6
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b 1100 10^2c+1 0 10^2 1").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+8 0 10^2b+2c+6").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b 1100 10^2c+1 0 10^2 1
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+1 1100 10^2c+1 0 10^2 1
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 010 0001^b 010 <B 0 10^2c+2 0 10^2 1
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+2c+1 0 10^2 1
+                        rule_step(5, &[("a", "b+c")]),
+                        rule_step(6, &[("a", "b+c+1")]),
+                        rule_step(7, &[("a", "b+c+2")]),
+                        // 0^inf 1100101 0001^a 010 <B 0100 10^2b+2c+7
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+5 0 10^2b+2c+7
+                        chain_step(0, "a+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+2 010 <B 00 10^2b+2c+6
+                        chain_step(1, "a+2"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+8 0 10^2b+2c+6
+                    ]),
+                },
+                // 16: 0^inf 1100101 B> 10^2a+2 0 10^2b 00 10^c+2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b 1100 10^c+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 00 10^c+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b 1100 10^c+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 00 10^c+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 00 10^c+2 0^inf
+                        chain_step(0, "b"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 010 0001^b 0101 B> 10^c+2 0^inf
+                        rule_step(3, &[("a", "c")]),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 01100 10^c+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b 1100 10^c+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b 1100 10^c+1 0^inf
+                    ]),
+                },
+                // 17: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^2 1100 10^c+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+5 0 10^c+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^2 1100 10^c+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+5 0 10^c+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^2 1100 10^c+1 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0 10^2 1100 10^c+1 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        rule_step(6, &[("a", "b+1")]),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+6 0 10^c+1 0^inf
+                        chain_step(0, "b+3"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 010 B> 10^c+2 0^inf
+                        rule_step(3, &[("a", "c")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 01010 <B 0100 10^c+1 0^inf
+                        chain_step(2, "b+2"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+5 0 10^c+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+5 0 10^c+1 0^inf
+                    ]),
+                },
+                // 18: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^d+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^d+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 B> 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 0100 10^2c+1 0 10^d+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b+1 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^d+1 0^inf
+                    ]),
+                },
+                // 19: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^2c+1 01  -->  0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^2c+1 01").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^2c+1 01
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0 10^3 0 10^2c+1 01
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        rule_step(6, &[("a", "b+1")]),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+5 00 10^2c+1 01
+                        chain_step(0, "b+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 0101 B> 10^2c+1 01
+                        chain_step(0, "c"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 0101 0001^c 010 <B 0
+                        chain_step(1, "c"),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 010 <B 01100 10^2c
+                        chain_step(1, "b+2"),
+                        base_step(107),
+                        // 0^inf 1100101 0001^a 010 <B 0100 10^2b+7 1100 10^2c
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+5 0 10^2b+7 1100 10^2c
+                        chain_step(0, "a+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+2 010 <B 00 10^2b+6 1100 10^2c
+                        chain_step(1, "a+2"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c
+                    ]),
+                },
+                // 20: 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+2 0 10^d+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2c+1 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+2 0 10^d+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2c+1 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 1100 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2c+3 0 10^d+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2c+2 0 10^d+1 0^inf
+                        chain_step(0, "b+c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "b+c"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+2c+1 0 10^d+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2c+1 0 10^d+1 0^inf
+                    ]),
+                },
+                // 21: 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^d+4 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+7 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^d+4 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+7 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^d+4 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+6 01100 10^2c+1 0 10^d+4 0^inf
+                        chain_step(0, "b+3"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b+2 011100101 B> 10^2c+1 0 10^d+4 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 0100 10^2c+7 0 10^d+1 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b 0 10^2c+7 01^d+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 B> 10^2c+8 0 10^d+1 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "c+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0100 10^2c+7 0 10^d+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+1 0 10^2c+7 0 10^d+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+7 0 10^d+1 0^inf
+                    ]),
+                },
+                // 22: 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+7 01 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+8 01100 10^2d+2 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+7 01 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+8 01100 10^2d+2 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+7 01 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+6 01100 10^2c+1 0 10^2d+7 01 0^inf
+                        chain_step(0, "b+3"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b+2 011100101 B> 10^2c+1 0 10^2d+7 01 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 0100 10^2c+7 0 10^2d+4 01 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 0 10^2c+7 0 10^2d+4 01 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 B> 10^2c+8 0 10^2d+4 01 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 B> 10^2d+5 01 0^inf
+                        rule_step(4, &[("a", "d+1")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 011100101 B> 10^2d+3 0^inf
+                        rule_step(3, &[("a", "2d+1")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 01010 <B 0 10^2 01100 10^2d+2 0^inf
+                        chain_step(2, "c+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0100 10^2c+8 01100 10^2d+2 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+1 0 10^2c+8 01100 10^2d+2 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+8 01100 10^2d+2 0^inf
+                    ]),
+                },
+                // 23: 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+4 01100 10^e+2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+7 0 10^2d+2 01100 10^e+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+4 01100 10^e+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+7 0 10^2d+2 01100 10^e+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+4 01100 10^e+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+6 01100 10^2c+1 0 10^2d+4 01100 10^e+2 0^inf
+                        chain_step(0, "b+3"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b+2 011100101 B> 10^2c+1 0 10^2d+4 01100 10^e+2 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 0100 10^2c+7 0 10^2d+1 01100 10^e+2 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 0 10^2c+7 0 10^2d+1 01100 10^e+2 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 B> 10^2c+8 0 10^2d+1 01100 10^e+2 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 B> 10^2d+2 01100 10^e+2 0^inf
+                        chain_step(0, "d+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 0001^d 011100101 B> 10^e+2 0^inf
+                        rule_step(3, &[("a", "e")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 0001^d 01010 <B 0 10^2 01100 10^e+1 0^inf
+                        chain_step(2, "d"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 01010 <B 0100 10^2d+2 01100 10^e+1 0^inf
+                        chain_step(2, "c+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0100 10^2c+7 0 10^2d+2 01100 10^e+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+1 0 10^2c+7 0 10^2d+2 01100 10^e+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+7 0 10^2d+2 01100 10^e+1 0^inf
+                    ]),
+                },
+                // 24: 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^2e+6 01100 10^f+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+8 01100 10^2e+1 0 10^f+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^2e+6 01100 10^f+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+8 01100 10^2e+1 0 10^f+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^2e+6 01100 10^f+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+6 01100 10^2c+1 0 10^2d+5 0 10^2e+6 01100 10^f+1 0^inf
+                        chain_step(0, "b+3"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b+2 011100101 B> 10^2c+1 0 10^2d+5 0 10^2e+6 01100 10^f+1 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 0100 10^2c+7 0 10^2d+2 0 10^2e+6 01100 10^f+1 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 0 10^2c+7 0 10^2d+2 0 10^2e+6 01100 10^f+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 B> 10^2c+8 0 10^2d+2 0 10^2e+6 01100 10^f+1 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 B> 10^2d+3 0 10^2e+6 01100 10^f+1 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+2 010 <B 0100 10^2d+7 0 10^2e+2 01100 10^f+1 0^inf
+                        chain_step(1, "c+2"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 B> 10^2c+4 0 10^2d+7 0 10^2e+2 01100 10^f+1 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 B> 10^2d+8 0 10^2e+2 01100 10^f+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 010 B> 10^2e+3 01100 10^f+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 010 0001^e+1 010 <B 0100 10^f+1 0^inf
+                        chain_step(1, "e+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 011100101 B> 10^2e+2 0 10^f+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 011100101 0001^e 010 B> 10^f+2 0^inf
+                        rule_step(3, &[("a", "f")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 011100101 0001^e 01010 <B 0100 10^f+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 01010 <B 0 10^2 01100 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 01010 <B 0100 10^2d+8 01100 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0 10^2 01100 10^2c+3 0 10^2d+8 01100 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+2 01100 10^2c+3 0 10^2d+8 01100 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+8 01100 10^2e+1 0 10^f+1 0^inf
+                    ]),
+                },
+                // 25: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+8 01100 10^2f+1 0 10^g+4 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+4 01100 10^2d+7 0 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+8 01100 10^2f+1 0 10^g+4 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+4 01100 10^2d+7 0 10^2e+1 0 10^2f+7 0 10^g+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+8 01100 10^2f+1 0 10^g+4 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 01100 10^2c+4 01100 10^2d+1 0 10^2e+8 01100 10^2f+1 0 10^g+4 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 B> 10^2c+4 01100 10^2d+1 0 10^2e+8 01100 10^2f+1 0 10^g+4 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c+1 011100101 B> 10^2d+1 0 10^2e+8 01100 10^2f+1 0 10^g+4 0^inf
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c 010 <B 0100 10^2d+7 0 10^2e+5 01100 10^2f+1 0 10^g+4 0^inf
+                        chain_step(1, "c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 B> 10^2c+4 0 10^2d+7 0 10^2e+5 01100 10^2f+1 0 10^g+4 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 B> 10^2d+8 0 10^2e+5 01100 10^2f+1 0 10^g+4 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 010 B> 10^2e+6 01100 10^2f+1 0 10^g+4 0^inf
+                        chain_step(0, "e+3"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 010 0001^e+2 011100101 B> 10^2f+1 0 10^g+4 0^inf
+                        rule_step(5, &[("a", "f")]),
+                        rule_step(6, &[("a", "f+1")]),
+                        rule_step(7, &[("a", "f+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 010 0001^e+1 010 <B 0100 10^2f+7 0 10^g+1 0^inf
+                        chain_step(1, "e+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 011100101 B> 10^2e+2 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 011100101 0001^e 010 B> 10^2f+8 0 10^g+1 0^inf
+                        chain_step(0, "f+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 011100101 0001^e 010 0001^f+3 010 B> 10^g+2 0^inf
+                        rule_step(3, &[("a", "g")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 011100101 0001^e 010 0001^f+3 01010 <B 0100 10^g+1 0^inf
+                        chain_step(2, "f+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 011100101 0001^e 01010 <B 0100 10^2f+7 0 10^g+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 01010 <B 0 10^2 01100 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 01010 <B 0100 10^2d+8 01100 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2 01100 10^2c+3 0 10^2d+8 01100 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 01100 10^2c+3 0 10^2d+8 01100 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^2c+3 0 10^2d+8 01100 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^2c+4 0 10^2d+8 01100 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 010 B> 10^2d+9 01100 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        rule_step(4, &[("a", "d+3")]),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 011100101 B> 10^2d+8 0 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 011100101 0001^d+3 010 B> 10^2e+2 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 011100101 0001^d+3 010 0001^e 010 B> 10^2f+8 0 10^g+1 0^inf
+                        chain_step(0, "f+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 011100101 0001^d+3 010 0001^e 010 0001^f+3 010 B> 10^g+2 0^inf
+                        rule_step(3, &[("a", "g")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 011100101 0001^d+3 010 0001^e 010 0001^f+3 01010 <B 0100 10^g+1 0^inf
+                        chain_step(2, "f+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 011100101 0001^d+3 010 0001^e 01010 <B 0100 10^2f+7 0 10^g+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 011100101 0001^d+3 01010 <B 0100 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 01010 <B 0 10^2 01100 10^2d+7 0 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0100 10^2c+4 01100 10^2d+7 0 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+3 0 10^2c+4 01100 10^2d+7 0 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+4 01100 10^2d+7 0 10^2e+1 0 10^2f+7 0 10^g+1 0^inf
+                    ]),
+                },
+                // 26: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 01001100 10^2c+3 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+7 0 10^3 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 01001100 10^2c+3 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+7 0 10^3 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 01001100 10^2c+3 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 01001100 10^2c+3 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+1 001100 10^2c+3 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "b"),
+                        base_step(24),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 B> 10^2c+2 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 0001^c 010 B> 10^2d+2 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "d+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 0001^c 010 0001^d 010 B> 10^2e+2 0 10^f+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 0001^c 010 0001^d 010 0001^e 010 B> 10^f+2 0^inf
+                        rule_step(3, &[("a", "f")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 0001^c 010 0001^d 010 0001^e 01010 <B 0100 10^f+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 0001^c 010 0001^d 01010 <B 0100 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "d"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 0001^c 01010 <B 0100 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(234),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 11001010001010 B> 10^2c+2 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 11001010001010 0001^c 010 B> 10^2d+2 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "d+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 11001010001010 0001^c 010 0001^d 010 B> 10^2e+2 0 10^f+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 11001010001010 0001^c 010 0001^d 010 0001^e 010 B> 10^f+2 0^inf
+                        rule_step(3, &[("a", "f")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 11001010001010 0001^c 010 0001^d 010 0001^e 01010 <B 0100 10^f+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 11001010001010 0001^c 010 0001^d 01010 <B 0100 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "d"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 11001010001010 0001^c 01010 <B 0100 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(120),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 010 <B 0 10^2 01100 10^3 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+5 01100 10^3 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        rule_step(6, &[("a", "b+2")]),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+8 0 10^3 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "b+4"),
+                        base_step(26),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 0100001010 B> 10^2c+2 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 0100001010 0001^c 010 B> 10^2d+2 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "d+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 0100001010 0001^c 010 0001^d 010 B> 10^2e+2 0 10^f+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 0100001010 0001^c 010 0001^d 010 0001^e 010 B> 10^f+2 0^inf
+                        rule_step(3, &[("a", "f")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 0100001010 0001^c 010 0001^d 010 0001^e 01010 <B 0100 10^f+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 0100001010 0001^c 010 0001^d 01010 <B 0100 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "d"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 0100001010 0001^c 01010 <B 0100 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(90),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 01010 <B 0100 10^3 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "b+3"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+7 0 10^3 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+7 0 10^3 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                    ]),
+                },
+                // 27: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 B> 10^2c+2 0 10^2d+1 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 B> 10^2d+2 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "d+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 010 B> 10^2e+2 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 010 0001^e 010 B> 10^2f+2 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "f+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 010 0001^e 010 0001^f 010 B> 10^2g+2 0 10^h+1 0^inf
+                        chain_step(0, "g+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 010 0001^e 010 0001^f 010 0001^g 010 B> 10^h+2 0^inf
+                        rule_step(3, &[("a", "h")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 010 0001^e 010 0001^f 010 0001^g 01010 <B 0100 10^h+1 0^inf
+                        chain_step(2, "g"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 010 0001^e 010 0001^f 01010 <B 0100 10^2g+1 0 10^h+1 0^inf
+                        chain_step(2, "f"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 010 0001^e 01010 <B 0100 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 01010 <B 0100 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(2, "d"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 01010 <B 0100 10^2d+1 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 0100 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                    ]),
+                },
+                // 28: 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^2e+5 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^2e+5 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^2e+5 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 1100 10^2c+4 0 10^2d+2 0 10^2e+5 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2c+5 0 10^2d+2 0 10^2e+5 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2c+4 0 10^2d+2 0 10^2e+5 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c+1 010 B> 10^2d+3 0 10^2e+5 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 010 <B 0100 10^2d+7 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(1, "b+c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+2c+4 0 10^2d+7 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 B> 10^2d+8 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 010 B> 10^2e+2 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 010 0001^e 010 B> 10^2f+2 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(0, "f+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 010 0001^e 010 0001^f 010 B> 10^2g+2 0 10^h+1 0^inf
+                        chain_step(0, "g+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 010 0001^e 010 0001^f 010 0001^g 010 B> 10^h+2 0^inf
+                        rule_step(3, &[("a", "h")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 010 0001^e 010 0001^f 010 0001^g 01010 <B 0100 10^h+1 0^inf
+                        chain_step(2, "g"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 010 0001^e 010 0001^f 01010 <B 0100 10^2g+1 0 10^h+1 0^inf
+                        chain_step(2, "f"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 010 0001^e 01010 <B 0100 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 01010 <B 0100 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 01010 <B 0100 10^2d+7 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(2, "b+c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^2f+1 0 10^2g+1 0 10^h+1 0^inf
+                    ]),
+                },
+                // 29: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 00 10^2c+1 0 10^2d+3 0 10^2e+5 0 10^f+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 00 10^2c+1 0 10^2d+3 0 10^2e+5 0 10^f+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 00 10^2c+1 0 10^2d+3 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 00 10^2c+1 0 10^2d+3 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+1 010 0001^b+1 0101 B> 10^2c+1 0 10^2d+3 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "c"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+1 010 0001^b+1 0101 0001^c 010 <B 00 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(1, "c"),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a+1 010 0001^b+1 010 <B 01100 10^2c 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+1 1100 10^2c 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 010 <B 0 10^2c+1 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+2c+4 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b+c+1 010 B> 10^2d+3 0 10^2e+5 0 10^f+1 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b+c 010 <B 0100 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(1, "b+c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+2c+4 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+1 010 B> 10^2d+8 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+1 010 0001^d+3 010 B> 10^2e+2 0 10^f+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+1 010 0001^d+3 010 0001^e 010 B> 10^f+2 0^inf
+                        rule_step(3, &[("a", "f")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+1 010 0001^d+3 010 0001^e 01010 <B 0100 10^f+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+1 010 0001^d+3 01010 <B 0100 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+1 01010 <B 0100 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "b+c+1"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                    ]),
+                },
+                // 30: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 B> 10^2c+2 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 B> 10^2d+2 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "d+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 010 B> 10^2e+2 0 10^f+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 010 0001^e 010 B> 10^f+2 0^inf
+                        rule_step(3, &[("a", "f")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 010 0001^e 01010 <B 0100 10^f+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 01010 <B 0100 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "d"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 01010 <B 0100 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 0100 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^2e+1 0 10^f+1 0^inf
+                    ]),
+                },
+                // 31: 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 1100 10^2c+4 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2c+5 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2c+4 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c+1 010 B> 10^2d+3 0 10^2e+5 0 10^f+1 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 010 <B 0100 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(1, "b+c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+2c+4 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 B> 10^2d+8 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 010 B> 10^2e+2 0 10^f+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 010 0001^e 010 B> 10^f+2 0^inf
+                        rule_step(3, &[("a", "f")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 010 0001^e 01010 <B 0100 10^f+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 01010 <B 0100 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 01010 <B 0100 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "b+c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                    ]),
+                },
+                // 32: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^2 0 10^2c+1 0 10^d+1 0^inf  -->  0^inf 1100101 B> 10^2a+8 0 10^2b+2c+7 0 10^d 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^2 0 10^2c+1 0 10^d+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+8 0 10^2b+2c+7 0 10^d 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^2 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0 10^2 0 10^2c+1 0 10^d+1 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+3 00 10^2c+1 0 10^d+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b+1 0101 B> 10^2c+1 0 10^d+1 0^inf
+                        chain_step(0, "c"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b+1 0101 0001^c 010 <B 00 10^d 0^inf
+                        chain_step(1, "c"),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b+1 010 <B 01100 10^2c 0 10^d 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+5 1100 10^2c 0 10^d 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 010 <B 0 10^2c+1 0 10^d 0^inf
+                        chain_step(1, "b+2"),
+                        base_step(107),
+                        // 0^inf 1100101 0001^a 010 <B 0100 10^2b+2c+8 0 10^d 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+5 0 10^2b+2c+8 0 10^d 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+2 010 <B 00 10^2b+2c+7 0 10^d 0^inf
+                        chain_step(1, "a+2"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+8 0 10^2b+2c+7 0 10^d 0^inf
+                    ]),
+                },
+                // 33: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^c+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^c+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^c+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^c+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^c+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 0 10^2c+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 B> 10^c+2 0^inf
+                        rule_step(3, &[("a", "c")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 0100 10^c+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b+1 0 10^c+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^c+1 0^inf
+                    ]),
+                },
+                // 34: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^c+2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+4 1100 10^c+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^c+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+4 1100 10^c+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^c+2 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0 10^3 0 10^c+2 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        rule_step(6, &[("a", "b+1")]),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+5 0^2 10^c+2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 0101 B> 10^c+2 0^inf
+                        rule_step(3, &[("a", "c")]),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 01010 <B 01100 10^c+1 0^inf
+                        chain_step(2, "b+2"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+4 1100 10^c+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+4 1100 10^c+1 0^inf
+                    ]),
+                },
+                // 35: 0^inf 1100101 B> 10^2a+2 0 10^2b+4 01 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+4 01 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+4 01 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+5 01 0^inf
+                        rule_step(4, &[("a", "b+1")]),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+3 0^inf
+                        rule_step(3, &[("a", "2b+1")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+2 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 0^inf
+                    ]),
+                },
+                // 36: 0^inf 1100101 B> 10^2a+2 0 10^2b 001 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b 11 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 001 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b 11 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 001 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 001 0^inf
+                        chain_step(0, "b"),
+                        base_step(16),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 011 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b 11 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b 11 0^inf
+                    ]),
+                },
+                // 37: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^2 11 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+5 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^2 11 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+5 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^2 11 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0 10^2 11 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        rule_step(6, &[("a", "b+1")]),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+6 0^inf
+                        rule_step(3, &[("a", "2b+4")]),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+5 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+5 0^inf
+                    ]),
+                },
+                // 38: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+4 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+4 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0 10^3 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        rule_step(6, &[("a", "b+1")]),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+5 0^inf
+                        rule_step(3, &[("a", "2b+3")]),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+4 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+4 0^inf
+                    ]),
+                },
+                // 39: 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^e+5 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0 10^e+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^e+5 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0 10^e+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^e+5 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+6 01100 10^2c+1 0 10^2d+5 0 10^e+5 0^inf
+                        chain_step(0, "b+3"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b+2 011100101 B> 10^2c+1 0 10^2d+5 0 10^e+5 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 0100 10^2c+7 0 10^2d+2 0 10^e+5 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 0 10^2c+7 0 10^2d+2 0 10^e+5 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 B> 10^2c+8 0 10^2d+2 0 10^e+5 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 B> 10^2d+3 0 10^e+5 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+2 010 <B 0100 10^2d+7 0 10^e+1 0^inf
+                        chain_step(1, "c+2"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 B> 10^2c+4 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 B> 10^2d+8 0 10^e+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 010 B> 10^e+2 0^inf
+                        rule_step(3, &[("a", "e")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 01010 <B 0100 10^e+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 01010 <B 0100 10^2d+7 0 10^e+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0 10^2 01100 10^2c+3 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0 10^e+1 0^inf
+                    ]),
+                },
+                // 40: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+5 0 10^f+5 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2c+3 0 10^2d+3 0 10^2e+7 0 10^f+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+5 0 10^f+5 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2c+3 0 10^2d+3 0 10^2e+7 0 10^f+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+5 0 10^f+5 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 01100 10^2c+4 01100 10^2d+1 0 10^2e+5 0 10^f+5 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 B> 10^2c+4 01100 10^2d+1 0 10^2e+5 0 10^f+5 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c+1 011100101 B> 10^2d+1 0 10^2e+5 0 10^f+5 0^inf
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c 010 <B 0100 10^2d+7 0 10^2e+2 0 10^f+5 0^inf
+                        chain_step(1, "c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 B> 10^2c+4 0 10^2d+7 0 10^2e+2 0 10^f+5 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 B> 10^2d+8 0 10^2e+2 0 10^f+5 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 010 B> 10^2e+3 0 10^f+5 0^inf
+                        rule_step(4, &[("a", "e")]),
+                        rule_step(5, &[("a", "e")]),
+                        rule_step(6, &[("a", "e+1")]),
+                        rule_step(7, &[("a", "e+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+2 010 <B 0100 10^2e+7 0 10^f+1 0^inf
+                        chain_step(1, "d+2"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 B> 10^2d+4 0 10^2e+7 0 10^f+1 0^inf
+                        chain_step(0, "d+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 0001^d+1 010 B> 10^2e+8 0 10^f+1 0^inf
+                        chain_step(0, "e+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 0001^d+1 010 0001^e+3 010 B> 10^f+2 0^inf
+                        rule_step(3, &[("a", "f")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 0001^d+1 010 0001^e+3 01010 <B 0100 10^f+1 0^inf
+                        chain_step(2, "e+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 0001^d+1 01010 <B 0100 10^2e+7 0 10^f+1 0^inf
+                        chain_step(2, "d+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 01010 <B 0 10^2 01100 10^2d+3 0 10^2e+7 0 10^f+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2 01100 10^2c+4 01100 10^2d+3 0 10^2e+7 0 10^f+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 01100 10^2c+4 01100 10^2d+3 0 10^2e+7 0 10^f+1 0^inf
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^2c+4 01100 10^2d+3 0 10^2e+7 0 10^f+1 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^2c+5 01100 10^2d+3 0 10^2e+7 0 10^f+1 0^inf
+                        rule_step(4, &[("a", "c+1")]),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 B> 10^2c+4 0 10^2d+3 0 10^2e+7 0 10^f+1 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 B> 10^2d+4 0 10^2e+7 0 10^f+1 0^inf
+                        chain_step(0, "d+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+1 010 B> 10^2e+8 0 10^f+1 0^inf
+                        chain_step(0, "e+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+1 010 0001^e+3 010 B> 10^f+2 0^inf
+                        rule_step(3, &[("a", "f")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+1 010 0001^e+3 01010 <B 0100 10^f+1 0^inf
+                        chain_step(2, "e+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+1 01010 <B 0100 10^2e+7 0 10^f+1 0^inf
+                        chain_step(2, "d+1"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 01010 <B 0100 10^2d+3 0 10^2e+7 0 10^f+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0 10^2 01100 10^2c+3 0 10^2d+3 0 10^2e+7 0 10^f+1 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+4 01100 10^2c+3 0 10^2d+3 0 10^2e+7 0 10^f+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2c+3 0 10^2d+3 0 10^2e+7 0 10^f+1 0^inf
+                    ]),
+                },
+                // 41: 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^2e+4n+1 0 10^f+1 0^inf  -->  0^inf 1100101 B> 10^2a+4n+2 01100 10^2b+4 01100 10^2c+2n+1 0 10^2d+2n+5 0 10^2e+1 0 10^f+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^2e+4n+1 0 10^f+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+4n+2 01100 10^2b+4 01100 10^2c+2n+1 0 10^2d+2n+5 0 10^2e+1 0 10^f+1 0^inf").unwrap(),
+                    proof: Proof::Inductive {
+                        proof_base: vec![],
+                        proof_inductive: vec![
+                            // 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^2e+4n+5 0 10^f+1 0^inf
+                            chain_step(0, "a+1"),
+                            base_step(49),
+                            // 0^inf 1100101 0001^a 011100101 B> 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^2e+4n+5 0 10^f+1 0^inf
+                            chain_step(0, "b+2"),
+                            base_step(49),
+                            // 0^inf 1100101 0001^a 011100101 0001^b+1 011100101 B> 10^2c+1 0 10^2d+5 0 10^2e+4n+5 0 10^f+1 0^inf
+                            rule_step(5, &[("a", "c")]),
+                            rule_step(6, &[("a", "c+1")]),
+                            rule_step(7, &[("a", "c+2")]),
+                            // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 0100 10^2c+7 0 10^2d+2 0 10^2e+4n+5 0 10^f+1 0^inf
+                            chain_step(1, "b"),
+                            base_step(146),
+                            // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^2c+7 0 10^2d+2 0 10^2e+4n+5 0 10^f+1 0^inf
+                            chain_step(0, "b+2"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^2c+8 0 10^2d+2 0 10^2e+4n+5 0 10^f+1 0^inf
+                            chain_step(0, "c+4"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 010 B> 10^2d+3 0 10^2e+4n+5 0 10^f+1 0^inf
+                            rule_step(4, &[("a", "d")]),
+                            rule_step(5, &[("a", "d")]),
+                            rule_step(6, &[("a", "d+1")]),
+                            rule_step(7, &[("a", "d+2")]),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+2 010 <B 0100 10^2d+7 0 10^2e+4n+1 0 10^f+1 0^inf
+                            chain_step(1, "c+2"),
+                            base_step(22),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 B> 10^2c+4 0 10^2d+7 0 10^2e+4n+1 0 10^f+1 0^inf
+                            chain_step(0, "c+2"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 B> 10^2d+8 0 10^2e+4n+1 0 10^f+1 0^inf
+                            chain_step(0, "d+4"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+3 010 B> 10^2e+4n+2 0 10^f+1 0^inf
+                            chain_step(0, "e+2n+1"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+3 010 0001^e+2n 010 B> 10^f+2 0^inf
+                            rule_step(3, &[("a", "f")]),
+                            base_step(9),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+3 010 0001^e+2n 01010 <B 0 00 10^f+1 0^inf
+                            chain_step(2, "e+2n"),
+                            base_step(9),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+3 01010 <B 0100 10^2e+4n+1 0 10^f+1 0^inf
+                            chain_step(2, "d+3"),
+                            base_step(9),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 01010 <B 0100 10^2d+7 0 10^2e+4n+1 0 10^f+1 0^inf
+                            chain_step(2, "c+1"),
+                            base_step(39),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0 10^2 01100 10^2c+3 0 10^2d+7 0 10^2e+4n+1 0 10^f+1 0^inf
+                            chain_step(2, "b+1"),
+                            base_step(39),
+                            // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+4 01100 10^2c+3 0 10^2d+7 0 10^2e+4n+1 0 10^f+1 0^inf
+                            chain_step(1, "a"),
+                            base_step(186),
+                            // 0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2c+3 0 10^2d+7 0 10^2e+4n+1 0 10^f+1 0^inf
+                            induction_step(&[("a", "a+2"), ("b", "b"), ("c", "c+1"), ("d", "d+1"), ("e", "e"), ("f", "f")]),
+                            // 0^inf 1100101 B> 10^2a+4n+6 01100 10^2b+4 01100 10^2c+2n+3 0 10^2d+2n+7 0 10^2e+1 0 10^f+1 0^inf
+                        ],
+                    },
+                },
+                // 42: 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^3 0 10^e+2 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+8 0 10^2d+4 1100 10^e+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^3 0 10^e+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+8 0 10^2d+4 1100 10^e+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^3 0 10^e+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^3 0 10^e+2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+1 011100101 B> 10^2c+1 0 10^2d+5 0 10^3 0 10^e+2 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 0100 10^2c+7 0 10^2d+2 0 10^3 0 10^e+2 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^2c+7 0 10^2d+2 0 10^3 0 10^e+2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^2c+8 0 10^2d+2 0 10^3 0 10^e+2 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 010 B> 10^2d+3 0 10^3 0 10^e+2 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+2 001100101 B> 10^2d+5 00 10^e+2 0^inf
+                        chain_step(0, "d+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+2 001100101 0001^d+2 0101 B> 10^e+2 0^inf
+                        rule_step(3, &[("a", "e")]),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+2 001100101 0001^d+2 01010 <B 01100 10^e+1 0^inf
+                        chain_step(2, "d+2"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+2 01010 <B 0 10^4 0 10^2d+4 1100 10^e+1 0^inf
+                        chain_step(2, "c+2"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0100 10^2c+8 0 10^2d+4 1100 10^e+1 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+3 0 10^2c+8 0 10^2d+4 1100 10^e+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+8 0 10^2d+4 1100 10^e+1 0^inf
+                    ]),
+                },
+                // 43: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^2c+2 1100 10^2 0^inf  -->  0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c+1 0 10^4 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^2c+2 1100 10^2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c+1 0 10^4 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^2c+2 1100 10^2 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0 10^3 0 10^2c+2 1100 10^2 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        rule_step(6, &[("a", "b+1")]),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+5 00 10^2c+2 1100 10^2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 0101 B> 10^2c+2 1100 10^2 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(198),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 0101 0001^c 010 <B 0100 10^4 0^inf
+                        chain_step(1, "c"),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 010 <B 01100 10^2c+1 0 10^4 0^inf
+                        chain_step(1, "b+2"),
+                        base_step(107),
+                        // 0^inf 1100101 0001^a 010 <B 0100 10^2b+7 1100 10^2c+1 0 10^4 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+5 0 10^2b+7 1100 10^2c+1 0 10^4 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+2 010 <B 00 10^2b+6 1100 10^2c+1 0 10^4 0^inf
+                        chain_step(1, "a+2"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c+1 0 10^4 0^inf
+                    ]),
+                },
+                // 44: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^2c+2 1100 10^d+3 0^inf  -->  0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c+1 0 10^4 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^2c+2 1100 10^d+3 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c+1 0 10^4 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 0 10^2c+2 1100 10^d+3 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0 10^3 0 10^2c+2 1100 10^d+3 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        rule_step(6, &[("a", "b+1")]),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+5 00 10^2c+2 1100 10^d+3 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 0101 B> 10^2c+2 1100 10^d+3 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(18),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 0101 0001^c+1 100101 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(174),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 0101 0001^c 010 <B 0100 10^4 0 10^d+1 0^inf
+                        chain_step(1, "c"),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 010 <B 01100 10^2c+1 0 10^4 0 10^d+1 0^inf
+                        chain_step(1, "b+2"),
+                        base_step(107),
+                        // 0^inf 1100101 0001^a 010 <B 0100 10^2b+7 1100 10^2c+1 0 10^4 0 10^d+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+5 0 10^2b+7 1100 10^2c+1 0 10^4 0 10^d+1 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+2 010 <B 00 10^2b+6 1100 10^2c+1 0 10^4 0 10^d+1 0^inf
+                        chain_step(1, "a+2"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c+1 0 10^4 0 10^d+1 0^inf
+                    ]),
+                },
+                // 45: 0^inf 1100101 B> 10^2a+2 0 10^2b+2 0100 10^c+2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b 1100 10^c+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+2 0100 10^c+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b 1100 10^c+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+2 0100 10^c+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+3 0100 10^c+2 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 00 10^c+2 0^inf
+                        chain_step(0, "b"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 0101 B> 10^c+2 0^inf
+                        rule_step(3, &[("a", "c")]),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 01100 10^c+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b 1100 10^c+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b 1100 10^c+1 0^inf
+                    ]),
+                },
+                // 46: 0^inf 1100101 B> 10^2a+2 0 10^2b+3 01100 10^2c+2 1100 10^d+7 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+4 0 10^2c+3 0 10^9 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+3 01100 10^2c+2 1100 10^d+7 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+4 0 10^2c+3 0 10^9 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+3 01100 10^2c+2 1100 10^d+7 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+4 01100 10^2c+2 1100 10^d+7 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 011100101 B> 10^2c+2 1100 10^d+7 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(18),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 011100101 0001^c+1 100101 B> 10^d+6 0^inf
+                        rule_step(3, &[("a", "d+4")]),
+                        base_step(174),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 011100101 0001^c 010 <B 0100 10^4 0 10^d+5 0^inf
+                        chain_step(1, "c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 1100101 B> 10^2c+4 0 10^4 0 10^d+5 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(1042),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 1100101 0001^c 010 <B 0100 10^9 0 10^d+1 0^inf
+                        chain_step(1, "c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 010 0001^b 001100101 B> 10^2c+4 0 10^9 0 10^d+1 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(50),
+                        // 0^inf 1100101 0001^a 010 0001^b 001100101 0001^c+1 010 0001^4 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(306),
+                        // 0^inf 1100101 0001^a 010 0001^b 001100101 0001^c+1 01010 <B 0100 10^9 0 10^d+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 0 10^4 0 10^2c+3 0 10^9 0 10^d+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b+4 0 10^2c+3 0 10^9 0 10^d+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+4 0 10^2c+3 0 10^9 0 10^d+1 0^inf
+                    ]),
+                },
+                // 47: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 00 10^2c+1 0 10^2d+3 0 10^e+5 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+3 0 10^2d+7 0 10^e+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 00 10^2c+1 0 10^2d+3 0 10^e+5 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+3 0 10^2d+7 0 10^e+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 00 10^2c+1 0 10^2d+3 0 10^e+5 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 00 10^2c+1 0 10^2d+3 0 10^e+5 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+1 010 0001^b+1 0101 B> 10^2c+1 0 10^2d+3 0 10^e+5 0^inf
+                        chain_step(0, "c"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+1 010 0001^b+1 0101 0001^c 010 <B 00 10^2d+2 0 10^e+5 0^inf
+                        chain_step(1, "c"),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a+1 010 0001^b+1 010 <B 01100 10^2c 0 10^2d+2 0 10^e+5 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+1 1100 10^2c 0 10^2d+2 0 10^e+5 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 010 <B 0 10^2c+1 0 10^2d+2 0 10^e+5 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+2c+4 0 10^2d+2 0 10^e+5 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b+c+1 010 B> 10^2d+3 0 10^e+5 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b+c 010 <B 0100 10^2d+7 0 10^e+1 0^inf
+                        chain_step(1, "b+c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+2c+4 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+1 010 B> 10^2d+8 0 10^e+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+1 010 0001^d+3 010 B> 10^e+2 0^inf
+                        rule_step(3, &[("a", "e")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+1 010 0001^d+3 01010 <B 0100 10^e+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+1 01010 <B 0100 10^2d+7 0 10^e+1 0^inf
+                        chain_step(2, "b+c+1"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+2c+3 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+3 0 10^2d+7 0 10^e+1 0^inf
+                    ]),
+                },
+                // 48: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^e+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^e+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^e+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^e+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 0 10^2c+1 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 B> 10^2c+2 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 B> 10^2d+2 0 10^e+1 0^inf
+                        chain_step(0, "d+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 010 B> 10^e+2 0^inf
+                        rule_step(3, &[("a", "e")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 010 0001^d 01010 <B 0100 10^e+1 0^inf
+                        chain_step(2, "d"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 0001^c 01010 <B 0100 10^2d+1 0 10^e+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 0100 10^2c+1 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+1 0 10^2c+1 0 10^2d+1 0 10^e+1 0^inf
+                    ]),
+                },
+                // 49: 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^e+5 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^2d+7 0 10^e+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^e+5 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^2d+7 0 10^e+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^e+5 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 1100 10^2c+4 0 10^2d+2 0 10^e+5 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2c+5 0 10^2d+2 0 10^e+5 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2c+4 0 10^2d+2 0 10^e+5 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c+1 010 B> 10^2d+3 0 10^e+5 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 010 <B 0100 10^2d+7 0 10^e+1 0^inf
+                        chain_step(1, "b+c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+2c+4 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 B> 10^2d+8 0 10^e+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 010 B> 10^e+2 0^inf
+                        rule_step(3, &[("a", "e")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^d+3 01010 <B 0100 10^e+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 01010 <B 0100 10^2d+7 0 10^e+1 0^inf
+                        chain_step(2, "b+c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+2c+3 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^4a+6 01100 10^2b+2c+3 0 10^2d+7 0 10^e+1 0^inf
+                    ]),
+                },
+                // 50: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0100 10^2c+2 1100 10^d+3 0^inf  -->  0^inf 1100101 B> 10^2a+8 0 10^2b+2c+8 0 10^3 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0100 10^2c+2 1100 10^d+3 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+8 0 10^2b+2c+8 0 10^3 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0100 10^2c+2 1100 10^d+3 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0100 10^2c+2 1100 10^d+3 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+1 00 10^2c+2 1100 10^d+3 0^inf
+                        chain_step(0, "b"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101 B> 10^2c+2 1100 10^d+3 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(18),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101 0001^c+1 100101 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(174),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101 0001^c 010 <B 0100 10^4 0 10^d+1 0^inf
+                        chain_step(1, "c"),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 010 <B 01100 10^2c+1 0 10^4 0 10^d+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+3 1100 10^2c+1 0 10^4 0 10^d+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b+1 010 <B 0 10^2c+2 0 10^4 0 10^d+1 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+2c+7 0 10^4 0 10^d+1 0^inf
+                        rule_step(7, &[("a", "b+c+3")]),
+                        // 0^inf 1100101 0001^a 010 <B 0100 10^2b+2c+9 0 10^3 0 10^d+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+5 0 10^2b+2c+9 0 10^3 0 10^d+1 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+2 010 <B 00 10^2b+2c+8 0 10^3 0 10^d+1 0^inf
+                        chain_step(1, "a+2"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+8 0 10^2b+2c+8 0 10^3 0 10^d+1 0^inf
+                    ]),
+                },
+                // 51: 0^inf 1100101 B> 10^2a+2 0 10^2b+2 0 10^2 01 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+2 11 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+2 0 10^2 01 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+2 11 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+2 0 10^2 01 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+3 0 10^2 01 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+3 001 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(16),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 011 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+2 11 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+2 11 0^inf
+                    ]),
+                },
+                // 52: 0^inf 1100101 B> 10^2a+2 01100 10^2b 11 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b 11 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 01100 10^2b 11 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b 11 0^inf
+                        chain_step(0, "b"),
+                        base_step(16),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 01 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0^inf
+                        rule_step(3, &[("a", "2b+2")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+3 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0^inf
+                    ]),
+                },
+                // 53: 0^inf 1100101 B> 10^2a+2 0 10^2b+2 0 10^2 0 10^c+2 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+2 1100 10^c+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+2 0 10^2 0 10^c+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+2 1100 10^c+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+2 0 10^2 0 10^c+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0 10^2 0 10^c+2 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+3 0^2 10^c+2 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 0101 B> 10^c+2 0^inf
+                        rule_step(3, &[("a", "c")]),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 01100 10^c+1 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+2 1100 10^c+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+2 1100 10^c+1 0^inf
+                    ]),
+                },
+                // 54: 0^inf 1100101 B> 10^2a+2 01100 10^2b+2 11001 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+4 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b+2 11001 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+4 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 01100 10^2b+2 11001 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 11001 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(246),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0 10^4 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+4 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+4 0^inf
+                    ]),
+                },
+                // 55: 0^inf 1100101 B> 10^2a+2 01100 10^2b+2 1100 10^2 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^4 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b+2 1100 10^2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^4 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 01100 10^2b+2 1100 10^2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 1100 10^2 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(198),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 0100 10^4 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^4 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^5 0^inf
+                        rule_step(3, &[("a", "3")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0100 10^4 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+3 0 10^4 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^4 0^inf
+                    ]),
+                },
+                // 56: 0^inf 1100101 B> 10^2a+2 01100 10^2b+2 1100 10^3 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b+2 1100 10^3 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 01100 10^2b+2 1100 10^3 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 1100 10^3 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(220),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 0100 10^4 01 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^4 01 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(306),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0 10^2 01100 10^2 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+4 01100 10^2 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2 0^inf
+                    ]),
+                },
+                // 57: 0^inf 1100101 B> 10^2a+2 01100 10^2b+2 01100 10^c+2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^c+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b+2 01100 10^c+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^c+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 01100 10^2b+2 01100 10^c+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 01100 10^c+2 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 B> 10^c+2 0^inf
+                        rule_step(3, &[("a", "c")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0 10^2 01100 10^c+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+2 01100 10^c+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^c+1 0^inf
+                    ]),
+                },
+                // 58: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 011001 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+2 011 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 011001 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+2 011 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 011001 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 01100 10^2c+2 011001 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 B> 10^2c+2 011001 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(94),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c 01010 <B 0 10^2 011 0^inf
+                        chain_step(2, "c"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 0 10^2 01100 10^2c+2 011 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b+2 01100 10^2c+2 011 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+2 011 0^inf
+                    ]),
+                },
+                // 59: 0^inf 1100101 B> 10^2a+2 0 10^2b+2 001100 10^2c+2 011 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+7 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+2 001100 10^2c+2 011 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+7 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+2 001100 10^2c+2 011 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+3 001100 10^2c+2 011 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(24),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 0101100101 B> 10^2c+1 011 0^inf
+                        chain_step(0, "c"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 0101100101 0001^c 010 <B 01 0^inf
+                        chain_step(1, "c"),
+                        base_step(102),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 01100 10^2c+4 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 1100 10^2c+4 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 0 10^2c+5 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+2c+8 0^inf
+                        rule_step(3, &[("a", "2b+2c+6")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+2c+7 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+7 0^inf
+                    ]),
+                },
+                // 60: 0^inf 1100101 B> 10^2a+4 01100 10^2b+2 1100 10^4 0^inf  -->  0^inf 1100101 B> 10^2a+8 0 10^2b+9 0 10^4 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 01100 10^2b+2 1100 10^4 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+8 0 10^2b+9 0 10^4 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 01100 10^2b+2 1100 10^4 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+2 1100 10^4 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(18),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b+1 100101 B> 10^3 0^inf
+                        rule_step(3, &[("a", "1")]),
+                        base_step(174),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 010 <B 0100 10^4 0 10^2 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+4 0 10^4 0 10^2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(612),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b+1 010 <B 0 10^2 01100 10^4 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+7 01100 10^4 0^inf
+                        rule_step(7, &[("a", "b+3")]),
+                        // 0^inf 1100101 0001^a 010 <B 0100 10^2b+10 0 10^4 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+5 0 10^2b+10 0 10^4 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+2 010 <B 00 10^2b+9 0 10^4 0^inf
+                        chain_step(1, "a+2"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+8 0 10^2b+9 0 10^4 0^inf
+                    ]),
+                },
+                // 61: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 1100 10^3 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2c+3 0 10^2 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 1100 10^3 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2c+3 0 10^2 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 1100 10^3 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 01100 10^2c+2 1100 10^3 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 B> 10^2c+2 1100 10^3 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(220),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c 010 <B 0100 10^4 01 0^inf
+                        chain_step(1, "c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 B> 10^2c+4 0 10^4 01 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(306),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 01010 <B 0 10^2 01100 10^2 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2 01100 10^2c+4 01100 10^2 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 01100 10^2c+4 01100 10^2 0^inf
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^2c+4 01100 10^2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^2c+5 01100 10^2 0^inf
+                        rule_step(4, &[("a", "c+1")]),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 B> 10^2c+4 0 10^2 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(100),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 01010 <B 0100 10^2 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0 10^2 01100 10^2c+3 0 10^2 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+4 01100 10^2c+3 0 10^2 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2c+3 0 10^2 0^inf
+                    ]),
+                },
+                // 62: 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+4 0 10^2c+4 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+4 0 10^2c+4 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+4 01100 10^2c+1 0 10^2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+1 011100101 B> 10^2c+1 0 10^2 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 001100101 B> 10^2c+5 0^inf
+                        rule_step(3, &[("a", "2c+3")]),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0 10^4 0 10^2c+4 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+4 0 10^2c+4 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+4 0 10^2c+4 0^inf
+                    ]),
+                },
+                // 63: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 0 10^d+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+1 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 0 10^d+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+1 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 01100 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 B> 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 0 10^2 01100 10^2c+1 0 10^d+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b+2 01100 10^2c+1 0 10^d+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+1 0 10^d+1 0^inf
+                    ]),
+                },
+                // 64: 0^inf 1100101 B> 10^2a+2 0 10^2b 001100 10^2c+3 0 10^d+1 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^3 0 10^2c+1 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 001100 10^2c+3 0 10^d+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^3 0 10^2c+1 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 001100 10^2c+3 0 10^d+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 001100 10^2c+3 0 10^d+1 0^inf
+                        chain_step(0, "b"),
+                        base_step(24),
+                        // 0^inf 1100101 0001^a 010 0001^b 0101100101 B> 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 0101100101 0001^c 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 0101100101 0001^c 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(234),
+                        // 0^inf 1100101 0001^a 010 0001^b 11001010001010 B> 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 11001010001010 0001^c 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 11001010001010 0001^c 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(120),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2 01100 10^3 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 01100 10^3 0 10^2c+1 0 10^d+1 0^inf
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^3 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(26),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 0100001010 B> 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 0100001010 0001^c 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 0100001010 0001^c 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(90),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0100 10^3 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+3 0 10^3 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^3 0 10^2c+1 0 10^d+1 0^inf
+                    ]),
+                },
+                // 65: 0^inf 1100101 B> 10^2a+2 0 10^2b+2 00 10^2c+1 0 10^d+2 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+2 00 10^2c+1 0 10^d+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+2 00 10^2c+1 0 10^d+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+3 00 10^2c+1 0 10^d+2 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 0101 B> 10^2c+1 0 10^d+2 0^inf
+                        chain_step(0, "c"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 0101 0001^c 010 <B 00 10^d+1 0^inf
+                        chain_step(1, "c"),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 01100 10^2c 0 10^d+1 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 1100 10^2c 0 10^d+1 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+2c+4 0 10^d+1 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "b+c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+2c+3 0 10^d+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^d+1 0^inf
+                    ]),
+                },
+                // 66: 0^inf 1100101 B> 10^2a+2 01100 10^2b+2 1100 10^5 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+4 0 10^6 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b+2 1100 10^5 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+4 0 10^6 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 01100 10^2b+2 1100 10^5 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 1100 10^5 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(300),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 0100 10^4 0 10^3 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^4 0 10^3 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(1118),
+                        // 0^inf 1100101 0001^a 1100101 0001^b 01010 <B 0 10^4 0 10^6 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+4 0 10^6 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+4 0 10^6 0^inf
+                    ]),
+                },
+                // 67: 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^3 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+8 0 10^2d+4 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^3 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+8 0 10^2d+4 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^3 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+6 01100 10^2c+1 0 10^2d+5 0 10^3 0^inf
+                        chain_step(0, "b+3"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b+2 011100101 B> 10^2c+1 0 10^2d+5 0 10^3 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 0100 10^2c+7 0 10^2d+2 0 10^3 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 0 10^2c+7 0 10^2d+2 0 10^3 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 B> 10^2c+8 0 10^2d+2 0 10^3 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 B> 10^2d+3 0 10^3 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+2 001100101 B> 10^2d+5 0^inf
+                        rule_step(3, &[("a", "2d+3")]),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+2 01010 <B 0 10^4 0 10^2d+4 0^inf
+                        chain_step(2, "c+2"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0100 10^2c+8 0 10^2d+4 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+1 0 10^2c+8 0 10^2d+4 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+8 0 10^2d+4 0^inf
+                    ]),
+                },
+                // 68: 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+4 0 10^e+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+7 0 10^2d+1 0 10^e+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+4 0 10^e+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+7 0 10^2d+1 0 10^e+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+4 0 10^e+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+6 01100 10^2c+1 0 10^2d+4 0 10^e+1 0^inf
+                        chain_step(0, "b+3"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b+2 011100101 B> 10^2c+1 0 10^2d+4 0 10^e+1 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 0100 10^2c+7 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 0 10^2c+7 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 B> 10^2c+8 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 B> 10^2d+2 0 10^e+1 0^inf
+                        chain_step(0, "d+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 0001^d 010 B> 10^e+2 0^inf
+                        rule_step(3, &[("a", "e")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 0001^d 01010 <B 0100 10^e+1 0^inf
+                        chain_step(2, "d"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 01010 <B 0100 10^2d+1 0 10^e+1 0^inf
+                        chain_step(2, "c+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0100 10^2c+7 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+1 0 10^2c+7 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+1 0 10^2c+7 0 10^2d+1 0 10^e+1 0^inf
+                    ]),
+                },
+                // 69: 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^2e+5 0 10^f+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^2e+5 0 10^f+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+6 01100 10^2c+1 0 10^2d+5 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "b+3"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b+2 011100101 B> 10^2c+1 0 10^2d+5 0 10^2e+5 0 10^f+1 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 0100 10^2c+7 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 0 10^2c+7 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 B> 10^2c+8 0 10^2d+2 0 10^2e+5 0 10^f+1 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 B> 10^2d+3 0 10^2e+5 0 10^f+1 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+2 010 <B 0100 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(1, "c+2"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 B> 10^2c+4 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 B> 10^2d+8 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 010 B> 10^2e+2 0 10^f+1 0^inf
+                        chain_step(0, "e+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 010 0001^e 010 B> 10^f+2 0^inf
+                        rule_step(3, &[("a", "f")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 010 0001^e 01010 <B 0100 10^f+1 0^inf
+                        chain_step(2, "e"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 0001^d+3 01010 <B 0100 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 01010 <B 0100 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0 10^2 01100 10^2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0 10^2e+1 0 10^f+1 0^inf
+                    ]),
+                },
+                // 70: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+5 0 10^2f+5 0 10^g+1 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2c+3 0 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+5 0 10^2f+5 0 10^g+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2c+3 0 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+5 0 10^2f+5 0 10^g+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 01100 10^2c+4 01100 10^2d+1 0 10^2e+5 0 10^2f+5 0 10^g+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 B> 10^2c+4 01100 10^2d+1 0 10^2e+5 0 10^2f+5 0 10^g+1 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c+1 011100101 B> 10^2d+1 0 10^2e+5 0 10^2f+5 0 10^g+1 0^inf
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c 010 <B 0100 10^2d+7 0 10^2e+2 0 10^2f+5 0 10^g+1 0^inf
+                        chain_step(1, "c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 B> 10^2c+4 0 10^2d+7 0 10^2e+2 0 10^2f+5 0 10^g+1 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 B> 10^2d+8 0 10^2e+2 0 10^2f+5 0 10^g+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 010 B> 10^2e+3 0 10^2f+5 0 10^g+1 0^inf
+                        rule_step(4, &[("a", "e")]),
+                        rule_step(5, &[("a", "e")]),
+                        rule_step(6, &[("a", "e+1")]),
+                        rule_step(7, &[("a", "e+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+2 010 <B 0100 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(1, "d+2"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 B> 10^2d+4 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(0, "d+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 0001^d+1 010 B> 10^2e+8 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(0, "e+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 0001^d+1 010 0001^e+3 010 B> 10^2f+2 0 10^g+1 0^inf
+                        chain_step(0, "f+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 0001^d+1 010 0001^e+3 010 0001^f 010 B> 10^g+2 0^inf
+                        rule_step(3, &[("a", "g")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 0001^d+1 010 0001^e+3 010 0001^f 01010 <B 0100 10^g+1 0^inf
+                        chain_step(2, "f"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 0001^d+1 010 0001^e+3 01010 <B 0100 10^2f+1 0 10^g+1 0^inf
+                        chain_step(2, "e+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 011100101 0001^d+1 01010 <B 0100 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(2, "d+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 01010 <B 0 10^2 01100 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2 01100 10^2c+4 01100 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 01100 10^2c+4 01100 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^2c+4 01100 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^2c+5 01100 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        rule_step(4, &[("a", "c+1")]),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 B> 10^2c+4 0 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 B> 10^2d+4 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(0, "d+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+1 010 B> 10^2e+8 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(0, "e+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+1 010 0001^e+3 010 B> 10^2f+2 0 10^g+1 0^inf
+                        chain_step(0, "f+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+1 010 0001^e+3 010 0001^f 010 B> 10^g+2 0^inf
+                        rule_step(3, &[("a", "g")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+1 010 0001^e+3 010 0001^f 01010 <B 0100 10^g+1 0^inf
+                        chain_step(2, "f"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+1 010 0001^e+3 01010 <B 0100 10^2f+1 0 10^g+1 0^inf
+                        chain_step(2, "e+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+1 01010 <B 0100 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(2, "d+1"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 01010 <B 0100 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0 10^2 01100 10^2c+3 0 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+4 01100 10^2c+3 0 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2c+3 0 10^2d+3 0 10^2e+7 0 10^2f+1 0 10^g+1 0^inf
+                    ]),
+                },
+                // 71: 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^2e+4n+1 0 10^2f+1 0 10^g+1 0^inf  -->  0^inf 1100101 B> 10^2a+4n+2 01100 10^2b+4 01100 10^2c+2n+1 0 10^2d+2n+5 0 10^2e+1 0 10^2f+1 0 10^g+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^2e+4n+1 0 10^2f+1 0 10^g+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+4n+2 01100 10^2b+4 01100 10^2c+2n+1 0 10^2d+2n+5 0 10^2e+1 0 10^2f+1 0 10^g+1 0^inf").unwrap(),
+                    proof: Proof::Inductive {
+                        proof_base: vec![],
+                        proof_inductive: vec![
+                            // 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^2e+4n+5 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(0, "a+1"),
+                            base_step(49),
+                            // 0^inf 1100101 0001^a 011100101 B> 10^2b+4 01100 10^2c+1 0 10^2d+5 0 10^2e+4n+5 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(0, "b+2"),
+                            base_step(49),
+                            // 0^inf 1100101 0001^a 011100101 0001^b+1 011100101 B> 10^2c+1 0 10^2d+5 0 10^2e+4n+5 0 10^2f+1 0 10^g+1 0^inf
+                            rule_step(5, &[("a", "c")]),
+                            rule_step(6, &[("a", "c+1")]),
+                            rule_step(7, &[("a", "c+2")]),
+                            // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 0100 10^2c+7 0 10^2d+2 0 10^2e+4n+5 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(1, "b"),
+                            base_step(146),
+                            // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^2c+7 0 10^2d+2 0 10^2e+4n+5 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(0, "b+2"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^2c+8 0 10^2d+2 0 10^2e+4n+5 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(0, "c+4"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 010 B> 10^2d+3 0 10^2e+4n+5 0 10^2f+1 0 10^g+1 0^inf
+                            rule_step(4, &[("a", "d")]),
+                            rule_step(5, &[("a", "d")]),
+                            rule_step(6, &[("a", "d+1")]),
+                            rule_step(7, &[("a", "d+2")]),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+2 010 <B 0100 10^2d+7 0 10^2e+4n+1 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(1, "c+2"),
+                            base_step(22),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 B> 10^2c+4 0 10^2d+7 0 10^2e+4n+1 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(0, "c+2"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 B> 10^2d+8 0 10^2e+4n+1 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(0, "d+4"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+3 010 B> 10^2e+4n+2 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(0, "e+2n+1"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+3 010 0001^e+2n 010 B> 10^2f+2 0 10^g+1 0^inf
+                            chain_step(0, "f+1"),
+                            base_step(5),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+3 010 0001^e+2n 010 0001^f 010 B> 10^g+2 0^inf
+                            rule_step(3, &[("a", "g")]),
+                            base_step(9),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+3 010 0001^e+2n 010 0001^f 01010 <B 0100 10^g+1 0^inf
+                            chain_step(2, "f"),
+                            base_step(9),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+3 010 0001^e+2n 01010 <B 0100 10^2f+1 0 10^g+1 0^inf
+                            chain_step(2, "e+2n"),
+                            base_step(9),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 010 0001^d+3 01010 <B 0100 10^2e+4n+1 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(2, "d+3"),
+                            base_step(9),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 011100101 0001^c+1 01010 <B 0100 10^2d+7 0 10^2e+4n+1 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(2, "c+1"),
+                            base_step(39),
+                            // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0 10^2 01100 10^2c+3 0 10^2d+7 0 10^2e+4n+1 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(2, "b+1"),
+                            base_step(39),
+                            // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+4 01100 10^2c+3 0 10^2d+7 0 10^2e+4n+1 0 10^2f+1 0 10^g+1 0^inf
+                            chain_step(1, "a"),
+                            base_step(186),
+                            // 0^inf 1100101 B> 10^2a+6 01100 10^2b+4 01100 10^2c+3 0 10^2d+7 0 10^2e+4n+1 0 10^2f+1 0 10^g+1 0^inf
+                            induction_step(&[("a", "a+2"), ("b", "b"), ("c", "c+1"), ("d", "d+1"), ("e", "e"), ("f", "f"), ("g", "g")]),
+                            // 0^inf 1100101 B> 10^2a+4n+6 01100 10^2b+4 01100 10^2c+2n+3 0 10^2d+2n+7 0 10^2e+1 0 10^2f+1 0 10^g+1 0^inf
+                        ],
+                    },
+                },
+                // 72: 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0100 10^2e+1 0 10^f+2 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+8 0 10^2d+2e+5 0 10^f+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0100 10^2e+1 0 10^f+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+8 0 10^2d+2e+5 0 10^f+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0100 10^2e+1 0 10^f+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+4 01100 10^2c+1 0 10^2d+5 0100 10^2e+1 0 10^f+2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+1 011100101 B> 10^2c+1 0 10^2d+5 0100 10^2e+1 0 10^f+2 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 0100 10^2c+7 0 10^2d+2 0100 10^2e+1 0 10^f+2 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^2c+7 0 10^2d+2 0100 10^2e+1 0 10^f+2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^2c+8 0 10^2d+2 0100 10^2e+1 0 10^f+2 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 010 B> 10^2d+3 0100 10^2e+1 0 10^f+2 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 011100101 B> 10^2d+1 00 10^2e+1 0 10^f+2 0^inf
+                        chain_step(0, "d"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 011100101 0001^d 0101 B> 10^2e+1 0 10^f+2 0^inf
+                        chain_step(0, "e"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 011100101 0001^d 0101 0001^e 010 <B 00 10^f+1 0^inf
+                        chain_step(1, "e"),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 011100101 0001^d 010 <B 01100 10^2e 0 10^f+1 0^inf
+                        chain_step(1, "d"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 1100101 B> 10^2d+3 1100 10^2e 0 10^f+1 0^inf
+                        chain_step(0, "d+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 1100101 0001^d+1 010 <B 0 10^2e+1 0 10^f+1 0^inf
+                        chain_step(1, "d+1"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+2 001100101 B> 10^2d+2e+6 0 10^f+1 0^inf
+                        chain_step(0, "d+e+3"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+2 001100101 0001^d+e+2 010 B> 10^f+2 0^inf
+                        rule_step(3, &[("a", "f")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+2 001100101 0001^d+e+2 01010 <B 0100 10^f+1 0^inf
+                        chain_step(2, "d+e+2"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+2 01010 <B 0 10^4 0 10^2d+2e+5 0 10^f+1 0^inf
+                        chain_step(2, "c+2"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0100 10^2c+8 0 10^2d+2e+5 0 10^f+1 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+3 0 10^2c+8 0 10^2d+2e+5 0 10^f+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+8 0 10^2d+2e+5 0 10^f+1 0^inf
+                    ]),
+                },
+                // 73: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0100 10^2c+1 0 10^d+2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+5 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0100 10^2c+1 0 10^d+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+5 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0100 10^2c+1 0 10^d+2 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0100 10^2c+1 0 10^d+2 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+1 00 10^2c+1 0 10^d+2 0^inf
+                        chain_step(0, "b"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101 B> 10^2c+1 0 10^d+2 0^inf
+                        chain_step(0, "c"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101 0001^c 010 <B 00 10^d+1 0^inf
+                        chain_step(1, "c"),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 010 <B 01100 10^2c 0 10^d+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+3 1100 10^2c 0 10^d+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b+1 010 <B 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+2c+6 0 10^d+1 0^inf
+                        chain_step(0, "b+c+3"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+2 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+2 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "b+c+2"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+2c+5 0 10^d+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+5 0 10^d+1 0^inf
+                    ]),
+                },
+                // 74: 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0100 10^e+2 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+8 01100 10^2d 1100 10^e+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0100 10^e+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+8 01100 10^2d 1100 10^e+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 01100 10^2b+4 01100 10^2c+1 0 10^2d+5 0100 10^e+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+4 01100 10^2c+1 0 10^2d+5 0100 10^e+2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+1 011100101 B> 10^2c+1 0 10^2d+5 0100 10^e+2 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 0100 10^2c+7 0 10^2d+2 0100 10^e+2 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^2c+7 0 10^2d+2 0100 10^e+2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^2c+8 0 10^2d+2 0100 10^e+2 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 010 B> 10^2d+3 0100 10^e+2 0^inf
+                        chain_step(0, "d+1"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 010 0001^d+1 010 <B 000 10^e+2 0^inf
+                        chain_step(1, "d+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 011100101 B> 10^2d+1 00 10^e+2 0^inf
+                        chain_step(0, "d"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 011100101 0001^d 0101 B> 10^e+2 0^inf
+                        rule_step(3, &[("a", "e")]),
+                        base_step(4),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 011100101 0001^d 01010 <B 01100 10^e+1 0^inf
+                        chain_step(2, "d"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+3 01010 <B 0 10^2 01100 10^2d 1100 10^e+1 0^inf
+                        chain_step(2, "c+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0100 10^2c+8 01100 10^2d 1100 10^e+1 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+3 0 10^2c+8 01100 10^2d 1100 10^e+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+8 01100 10^2d 1100 10^e+1 0^inf
+                    ]),
+                },
+                // 75: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 01001100 10^2c+2 1100 10^d 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+d+9 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 01001100 10^2c+2 1100 10^d 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+d+9 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 01001100 10^2c+2 1100 10^d 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 01001100 10^2c+2 1100 10^d 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+1 001100 10^2c+2 1100 10^d 0^inf
+                        chain_step(0, "b"),
+                        base_step(24),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 B> 10^2c+1 1100 10^d 0^inf
+                        chain_step(0, "c"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 0001^c 010 <B 0 10^d+1 0^inf
+                        chain_step(1, "c"),
+                        base_step(102),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 010 <B 01100 10^2c+d+4 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+3 1100 10^2c+d+4 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b+1 010 <B 0 10^2c+d+5 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+2c+d+10 0^inf
+                        rule_step(3, &[("a", "2b+2c+d+8")]),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+2c+d+9 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+d+9 0^inf
+                    ]),
+                },
+                // 76: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 01100 10^2c+2 1100 10^d 0^inf  -->  0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c+d+4 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 01100 10^2c+2 1100 10^d 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c+d+4 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 0 10^3 01100 10^2c+2 1100 10^d 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 0 10^3 01100 10^2c+2 1100 10^d 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        rule_step(5, &[("a", "b")]),
+                        rule_step(6, &[("a", "b+1")]),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+5 001100 10^2c+2 1100 10^d 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(24),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 0101100101 B> 10^2c+1 1100 10^d 0^inf
+                        chain_step(0, "c"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 0101100101 0001^c 010 <B 0 10^d+1 0^inf
+                        chain_step(1, "c"),
+                        base_step(102),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+2 010 <B 01100 10^2c+d+4 0^inf
+                        chain_step(1, "b+2"),
+                        base_step(107),
+                        // 0^inf 1100101 0001^a 010 <B 0100 10^2b+7 1100 10^2c+d+4 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+5 0 10^2b+7 1100 10^2c+d+4 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a+2 010 <B 00 10^2b+6 1100 10^2c+d+4 0^inf
+                        chain_step(1, "a+2"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+8 0 10^2b+6 1100 10^2c+d+4 0^inf
+                    ]),
+                },
+                // 77: 0^inf 1100101 B> 10^2a+4 01100 10^2b+2 1100 10^6 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+3 0 10^9 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 01100 10^2b+2 1100 10^6 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+3 0 10^9 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 01100 10^2b+2 1100 10^6 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+2 1100 10^6 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(358),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 010 <B 0100 10^4 0 10^4 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+4 0 10^4 0 10^4 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(1042),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b 010 <B 0100 10^9 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+4 0 10^9 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(362),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+1 01010 <B 0100 10^9 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+3 0 10^9 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+3 0 10^9 0^inf
+                    ]),
+                },
+                // 78: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+7 01 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+4 01100 10^2d+7 0 10^2e+2 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+7 01 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+4 01100 10^2d+7 0 10^2e+2 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^2e+7 01 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 01100 10^2c+4 01100 10^2d+1 0 10^2e+7 01 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 B> 10^2c+4 01100 10^2d+1 0 10^2e+7 01 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c+1 011100101 B> 10^2d+1 0 10^2e+7 01 0^inf
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c 010 <B 0100 10^2d+7 0 10^2e+4 01 0^inf
+                        chain_step(1, "c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 B> 10^2c+4 0 10^2d+7 0 10^2e+4 01 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 B> 10^2d+8 0 10^2e+4 01 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 010 B> 10^2e+5 01 0^inf
+                        rule_step(4, &[("a", "e+1")]),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 011100101 B> 10^2e+3 0^inf
+                        rule_step(3, &[("a", "2e+1")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 01010 <B 0 10^2 01100 10^2e+2 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 01010 <B 0100 10^2d+8 01100 10^2e+2 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2 01100 10^2c+3 0 10^2d+8 01100 10^2e+2 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 01100 10^2c+3 0 10^2d+8 01100 10^2e+2 0^inf
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^2c+3 0 10^2d+8 01100 10^2e+2 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^2c+4 0 10^2d+8 01100 10^2e+2 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 010 B> 10^2d+9 01100 10^2e+2 0^inf
+                        rule_step(4, &[("a", "d+3")]),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 011100101 B> 10^2d+8 0 10^2e+2 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 011100101 0001^d+3 010 B> 10^2e+3 0^inf
+                        rule_step(3, &[("a", "2e+1")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 011100101 0001^d+3 01010 <B 0100 10^2e+2 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 01010 <B 0 10^2 01100 10^2d+7 0 10^2e+2 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0100 10^2c+4 01100 10^2d+7 0 10^2e+2 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+3 0 10^2c+4 01100 10^2d+7 0 10^2e+2 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+4 01100 10^2d+7 0 10^2e+2 0^inf
+                    ]),
+                },
+                // 79: 0^inf 1100101 B> 10^2a+4 0 10^2b+2 01001100 10^2c+3 0 10^d+1 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+7 0 10^3 0 10^2c+1 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b+2 01001100 10^2c+3 0 10^d+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+7 0 10^3 0 10^2c+1 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b+2 01001100 10^2c+3 0 10^d+1 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+3 01001100 10^2c+3 0 10^d+1 0^inf
+                        rule_step(4, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+1 001100 10^2c+3 0 10^d+1 0^inf
+                        chain_step(0, "b"),
+                        base_step(24),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 B> 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 0001^c 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 0101100101 0001^c 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(234),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 11001010001010 B> 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 11001010001010 0001^c 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 11001010001010 0001^c 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(120),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 010 <B 0 10^2 01100 10^3 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+5 01100 10^3 0 10^2c+1 0 10^d+1 0^inf
+                        rule_step(6, &[("a", "b+2")]),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+8 0 10^3 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(0, "b+4"),
+                        base_step(26),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 0100001010 B> 10^2c+2 0 10^d+1 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 0100001010 0001^c 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 0100001010 0001^c 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(90),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+3 01010 <B 0100 10^3 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(2, "b+3"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+7 0 10^3 0 10^2c+1 0 10^d+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+7 0 10^3 0 10^2c+1 0 10^d+1 0^inf
+                    ]),
+                },
+                // 80: 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2 0 10^2d+5 0 10^e+1 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^7 0 10^2d+1 0 10^e+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2 0 10^2d+5 0 10^e+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^7 0 10^2d+1 0 10^e+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2 0 10^2d+5 0 10^e+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 1100 10^2c+4 0 10^2 0 10^2d+5 0 10^e+1 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2c+5 0 10^2 0 10^2d+5 0 10^e+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2c+4 0 10^2 0 10^2d+5 0 10^e+1 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(746),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 010 <B 0100 10^7 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(1, "b+c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+2c+4 0 10^7 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(42),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^3 010 B> 10^2d+2 0 10^e+1 0^inf
+                        chain_step(0, "d+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^3 010 0001^d 010 B> 10^e+2 0^inf
+                        rule_step(3, &[("a", "e")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 0001^3 010 0001^d 01010 <B 0100 10^e+1 0^inf
+                        chain_step(2, "d"),
+                        base_step(234),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 01010 <B 0100 10^7 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(2, "b+c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+2c+3 0 10^7 0 10^2d+1 0 10^e+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^7 0 10^2d+1 0 10^e+1 0^inf
+                    ]),
+                },
+                // 81: 0^inf 1100101 B> 10^2a+4 01100 10^2b+2 1100 10^c+7 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+3 0 10^9 0 10^c+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 01100 10^2b+2 1100 10^c+7 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+3 0 10^9 0 10^c+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 01100 10^2b+2 1100 10^c+7 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+2 1100 10^c+7 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(18),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b+1 100101 B> 10^c+6 0^inf
+                        rule_step(3, &[("a", "c+4")]),
+                        base_step(174),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b 010 <B 0100 10^4 0 10^c+5 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+4 0 10^4 0 10^c+5 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(1042),
+                        // 0^inf 1100101 0001^a+1 1100101 0001^b 010 <B 0100 10^9 0 10^c+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+4 0 10^9 0 10^c+1 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(50),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+1 010 0001^4 010 B> 10^c+2 0^inf
+                        rule_step(3, &[("a", "c")]),
+                        base_step(306),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+1 01010 <B 0100 10^9 0 10^c+1 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+3 0 10^9 0 10^c+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+3 0 10^9 0 10^c+1 0^inf
+                    ]),
+                },
+                // 82: 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+2 0 10^2d+4 01 0^inf  -->  0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+2 0 10^2d+4 01 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+2 0 10^2d+4 01 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2c+2 01100 10^2d+2 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+2 0 10^2d+4 01 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 1100 10^2c+2 0 10^2d+4 01 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2c+3 0 10^2d+4 01 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2c+2 0 10^2d+4 01 0^inf
+                        chain_step(0, "b+c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 010 B> 10^2d+5 01 0^inf
+                        rule_step(4, &[("a", "d+1")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 011100101 B> 10^2d+3 0^inf
+                        rule_step(3, &[("a", "2d+1")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 01010 <B 0 10^2 01100 10^2d+2 0^inf
+                        chain_step(2, "b+c"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+2c+2 01100 10^2d+2 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2c+2 01100 10^2d+2 0^inf
+                    ]),
+                },
+                // 83: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 01100 10^d+2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+2 01100 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 01100 10^d+2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+2 01100 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+2 01100 10^d+2 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 01100 10^2c+2 01100 10^d+2 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 B> 10^2c+2 01100 10^d+2 0^inf
+                        chain_step(0, "c+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c 011100101 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c 01010 <B 0 10^2 01100 10^d+1 0^inf
+                        chain_step(2, "c"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 01010 <B 0 10^2 01100 10^2c+2 01100 10^d+1 0^inf
+                        chain_step(2, "b"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 01010 <B 0100 10^2b+2 01100 10^2c+2 01100 10^d+1 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a 0 10^2b+2 01100 10^2c+2 01100 10^d+1 0^inf
+                    ]),
+                },
+                // 84: 0^inf 1100101 B> 10^2a+2 0 10^2b+2 001100 10^2c+2 01100 10^d+1 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+7 0 10^d+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+2 001100 10^2c+2 01100 10^d+1 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+7 0 10^d+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+2 001100 10^2c+2 01100 10^d+1 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+3 001100 10^2c+2 01100 10^d+1 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(24),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 0101100101 B> 10^2c+1 01100 10^d+1 0^inf
+                        chain_step(0, "c"),
+                        base_step(6),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 0101100101 0001^c 010 <B 0100 10^d+1 0^inf
+                        chain_step(1, "c"),
+                        base_step(102),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 01100 10^2c+4 0 10^d+1 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 1100 10^2c+4 0 10^d+1 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 <B 0 10^2c+5 0 10^d+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+2c+8 0 10^d+1 0^inf
+                        chain_step(0, "b+c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+3 010 B> 10^d+2 0^inf
+                        rule_step(3, &[("a", "d")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+3 01010 <B 0100 10^d+1 0^inf
+                        chain_step(2, "b+c+3"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+2c+7 0 10^d+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+7 0 10^d+1 0^inf
+                    ]),
+                },
+                // 85: 0^inf 1100101 B> 10^2a+4 0 10^2b 1100 10^2c+2 0 10^2d+2 0 10^2 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+7 0 10^2d+2 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+4 0 10^2b 1100 10^2c+2 0 10^2d+2 0 10^2 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+7 0 10^2d+2 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+4 0 10^2b 1100 10^2c+2 0 10^2d+2 0 10^2 0^inf
+                        chain_step(0, "a+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 010 B> 10^2b+1 1100 10^2c+2 0 10^2d+2 0 10^2 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 010 0001^b 010 <B 0 10^2c+3 0 10^2d+2 0 10^2 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a+1 011100101 B> 10^2b+2c+2 0 10^2d+2 0 10^2 0^inf
+                        chain_step(0, "b+c+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b+c 010 B> 10^2d+3 0 10^2 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b+c 1100101 B> 10^2d+3 0^inf
+                        rule_step(3, &[("a", "2d+1")]),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a+1 011100101 0001^b+c 010 <B 0 10^2 01100 10^2d+2 0^inf
+                        chain_step(1, "b+c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a+1 1100101 B> 10^2b+2c+5 01100 10^2d+2 0^inf
+                        rule_step(6, &[("a", "b+c+2")]),
+                        // 0^inf 1100101 0001^a 001100101 B> 10^2b+2c+8 0 10^2d+2 0^inf
+                        chain_step(0, "b+c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+3 010 B> 10^2d+3 0^inf
+                        rule_step(3, &[("a", "2d+1")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 001100101 0001^b+c+3 01010 <B 0100 10^2d+2 0^inf
+                        chain_step(2, "b+c+3"),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^4 0 10^2b+2c+7 0 10^2d+2 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+3 0 10^2b+2c+7 0 10^2d+2 0^inf
+                    ]),
+                },
+                // 86: 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^4 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^4 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+5 01100 10^2c+1 0 10^2d+5 0 10^4 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+6 01100 10^2c+1 0 10^2d+5 0 10^4 0^inf
+                        chain_step(0, "b+3"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b+2 011100101 B> 10^2c+1 0 10^2d+5 0 10^4 0^inf
+                        rule_step(5, &[("a", "c")]),
+                        rule_step(6, &[("a", "c+1")]),
+                        rule_step(7, &[("a", "c+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b+1 010 <B 0100 10^2c+7 0 10^2d+2 0 10^4 0^inf
+                        chain_step(1, "b+1"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2 0 10^2c+7 0 10^2d+2 0 10^4 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 B> 10^2c+8 0 10^2d+2 0 10^4 0^inf
+                        chain_step(0, "c+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+3 010 B> 10^2d+3 0 10^4 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 010 0001^c+2 010 <B 0100 10^2d+7 0^inf
+                        chain_step(1, "c+2"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 B> 10^2c+4 0 10^2d+7 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 010 B> 10^2d+8 0^inf
+                        rule_step(3, &[("a", "2d+6")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 011100101 0001^c+1 01010 <B 0100 10^2d+7 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 011100101 0001^b 01010 <B 0 10^2 01100 10^2c+3 0 10^2d+7 0^inf
+                        chain_step(2, "b"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2 01100 10^2c+3 0 10^2d+7 0^inf
+                    ]),
+                },
+                // 87: 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^e+4 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+3 0 10^2d+7 0 10^e+1 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^e+4 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+3 0 10^2d+7 0 10^e+1 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b+1 01100 10^2c+4 01100 10^2d+1 0 10^e+4 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+2 01100 10^2c+4 01100 10^2d+1 0 10^e+4 0^inf
+                        chain_step(0, "b+1"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 B> 10^2c+4 01100 10^2d+1 0 10^e+4 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(49),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c+1 011100101 B> 10^2d+1 0 10^e+4 0^inf
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 010 0001^b 011100101 0001^c 010 <B 0100 10^2d+7 0 10^e+1 0^inf
+                        chain_step(1, "c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 B> 10^2c+4 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 B> 10^2d+8 0 10^e+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 010 B> 10^e+2 0^inf
+                        rule_step(3, &[("a", "e")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 010 0001^d+3 01010 <B 0100 10^e+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 010 0001^b 1100101 0001^c+1 01010 <B 0100 10^2d+7 0 10^e+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2 01100 10^2c+3 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+1 01100 10^2c+3 0 10^2d+7 0 10^e+1 0^inf
+                        rule_step(5, &[("a", "b")]),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+4 0 10^2c+3 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(0, "b+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 B> 10^2c+4 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(0, "c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 010 B> 10^2d+8 0 10^e+1 0^inf
+                        chain_step(0, "d+4"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 010 0001^d+3 010 B> 10^e+2 0^inf
+                        rule_step(3, &[("a", "e")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 010 0001^d+3 01010 <B 0100 10^e+1 0^inf
+                        chain_step(2, "d+3"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 010 0001^c+1 01010 <B 0100 10^2d+7 0 10^e+1 0^inf
+                        chain_step(2, "c+1"),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+1 01010 <B 0100 10^2c+3 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(2, "b+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+3 0 10^2c+3 0 10^2d+7 0 10^e+1 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+3 0 10^2c+3 0 10^2d+7 0 10^e+1 0^inf
+                    ]),
+                },
+                // 88: 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^3 0^inf  -->  0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2c+4 0 10^2d+4 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^3 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2c+4 0 10^2d+4 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^3 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 1100 10^2c+4 0 10^2d+2 0 10^3 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 010 10^2c+4 0 10^2d+2 0 10^3 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2c+4 0 10^2d+2 0 10^3 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c+1 010 B> 10^2d+3 0 10^3 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 001100101 B> 10^2d+5 0^inf
+                        rule_step(3, &[("a", "2d+3")]),
+                        base_step(165),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 01010 <B 0 10^4 0 10^2d+4 0^inf
+                        chain_step(2, "b+c"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 01010 <B 0 10^2 01100 10^2b+2c+4 0 10^2d+4 0^inf
+                        chain_step(2, "a"),
+                        base_step(593),
+                        // 0^inf 1100101 B> 10^8 0 10^2a+1 01100 10^2b+2c+4 0 10^2d+4 0^inf
+                    ]),
+                },
+                // 89: 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^4 0^inf  -->  0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^2d+7 0^inf
+                Rule {
+                    init_config: Config::from_str("0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^4 0^inf").unwrap(),
+                    final_config: Config::from_str("0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^2d+7 0^inf").unwrap(),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^2a+2 0 10^2b 1100 10^2c+4 0 10^2d+2 0 10^4 0^inf
+                        chain_step(0, "a+1"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 010 B> 10^2b+1 1100 10^2c+4 0 10^2d+2 0 10^4 0^inf
+                        chain_step(0, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 010 0001^b 010 <B 0 10^2c+5 0 10^2d+2 0 10^4 0^inf
+                        chain_step(1, "b"),
+                        base_step(22),
+                        // 0^inf 1100101 0001^a 011100101 B> 10^2b+2c+4 0 10^2d+2 0 10^4 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c+1 010 B> 10^2d+3 0 10^4 0^inf
+                        rule_step(4, &[("a", "d")]),
+                        rule_step(5, &[("a", "d")]),
+                        rule_step(6, &[("a", "d+1")]),
+                        rule_step(7, &[("a", "d+2")]),
+                        // 0^inf 1100101 0001^a 011100101 0001^b+c 010 <B 0100 10^2d+7 0^inf
+                        chain_step(1, "b+c"),
+                        base_step(146),
+                        // 0^inf 1100101 0001^a 1100101 B> 10^2b+2c+4 0 10^2d+7 0^inf
+                        chain_step(0, "b+c+2"),
+                        base_step(5),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 010 B> 10^2d+8 0^inf
+                        rule_step(3, &[("a", "2d+6")]),
+                        base_step(9),
+                        // 0^inf 1100101 0001^a 1100101 0001^b+c+1 01010 <B 0100 10^2d+7 0^inf
+                        chain_step(2, "b+c+1"),
+                        base_step(39),
+                        // 0^inf 1100101 0001^a 010 <B 0 10^2 01100 10^2b+2c+3 0 10^2d+7 0^inf
+                        chain_step(1, "a"),
+                        base_step(186),
+                        // 0^inf 1100101 B> 10^2a+6 01100 10^2b+2c+3 0 10^2d+7 0^inf
+                    ]),
+                },
+                // 90: 0^inf A> 0^inf  -->  A(39, 39, 269)
+                Rule {
+                    init_config: Config::from_str("0^inf A> 0^inf").unwrap(),
+                    final_config: a("39", "39", "269"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf A> 0^inf
+                        base_step(109),
+                        // 0^inf 1100101 B> 10^2 0^inf
+                        rule_step(8, &[("a", "0")]),
+                        // 0^inf 1100101 B> 10^8 0^inf
+                        rule_step(8, &[("a", "6")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0^inf
+                        rule_step(9, &[("a", "3"), ("b", "5")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^6 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "2"), ("n", "1")]),
+                        // 0^inf 1100101 B> 10^12 0 10^10 0 10^2 0^inf
+                        rule_step(11, &[("a", "5"), ("b", "4")]),
+                        // 0^inf 1100101 B> 10^16 01100 10^10 0^inf
+                        rule_step(12, &[("a", "7"), ("b", "0"), ("c", "8")]),
+                        // 0^inf 1100101 B> 10^8 0 10^15 01100 10^9 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "7"), ("c", "0"), ("d", "7")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^16 01100 10^8 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "4")]),
+                        // 0^inf 1100101 B> 10^24 0 10^22 001100 10^8 0^inf
+                        rule_step(14, &[("a", "11"), ("b", "11"), ("c", "5")]),
+                        // 0^inf 1100101 B> 10^28 01100 10^25 0 10^3 0 10^6 0^inf
+                        rule_step(15, &[("a", "12"), ("b", "0"), ("c", "12")]),
+                        // 0^inf 1100101 B> 10^32 0 10^30 00 10^6 0^inf
+                        rule_step(16, &[("a", "15"), ("b", "15"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^8 0 10^30 0 10^30 1100 10^5 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "14"), ("c", "2"), ("n", "7")]),
+                        // 0^inf 1100101 B> 10^36 0 10^58 0 10^2 1100 10^5 0^inf
+                        rule_step(17, &[("a", "16"), ("b", "28"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^8 0 10^35 0 10^61 0 10^5 0^inf
+                        rule_step(18, &[("a", "3"), ("b", "17"), ("c", "30"), ("d", "4")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^35 0 10^61 0 10^5 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "8")]),
+                        // 0^inf 1100101 B> 10^40 0 10^38 0 10^3 0 10^61 0 10^5 0^inf
+                        rule_step(19, &[("a", "18"), ("b", "18"), ("c", "30")]),
+                        // 0^inf 1100101 B> 10^44 0 10^42 1100 10^60 0 10^4 0^inf
+                        rule_step(20, &[("a", "21"), ("b", "21"), ("c", "29"), ("d", "3")]),
+                        // 0^inf 1100101 B> 10^8 0 10^43 01100 10^101 0 10^4 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "19"), ("c", "50"), ("d", "0")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^39 0 10^107 01 0^inf
+                        rule_step(22, &[("a", "3"), ("b", "1"), ("c", "19"), ("d", "50")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^3 0 10^46 01100 10^102 0^inf
+                        rule_step(23, &[("a", "3"), ("b", "1"), ("c", "1"), ("d", "21"), ("e", "100")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^3 0 10^9 0 10^44 01100 10^101 0^inf
+                        rule_step(24, &[("a", "3"), ("b", "1"), ("c", "1"), ("d", "2"), ("e", "19"), ("f", "100")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^5 0 10^12 01100 10^39 0 10^101 0^inf
+                        rule_step(25, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "2"), ("e", "2"), ("f", "19"), ("g", "97")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^9 0 10^4 01100 10^11 0 10^5 0 10^45 0 10^98 0^inf
+                        rule_step(15, &[("a", "4"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^16 0 10^14 01001100 10^11 0 10^5 0 10^45 0 10^98 0^inf
+                        rule_step(26, &[("a", "6"), ("b", "6"), ("c", "4"), ("d", "2"), ("e", "22"), ("f", "97")]),
+                        // 0^inf 1100101 B> 10^8 0 10^15 0 10^19 0 10^3 0 10^9 0 10^5 0 10^45 0 10^98 0^inf
+                        rule_step(27, &[("a", "3"), ("b", "7"), ("c", "9"), ("d", "1"), ("e", "4"), ("f", "2"), ("g", "22"), ("h", "97")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^15 0 10^19 0 10^3 0 10^9 0 10^5 0 10^45 0 10^98 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "3")]),
+                        // 0^inf 1100101 B> 10^20 0 10^18 0 10^3 0 10^19 0 10^3 0 10^9 0 10^5 0 10^45 0 10^98 0^inf
+                        rule_step(19, &[("a", "8"), ("b", "8"), ("c", "9")]),
+                        // 0^inf 1100101 B> 10^24 0 10^22 1100 10^18 0 10^2 0 10^9 0 10^5 0 10^45 0 10^98 0^inf
+                        rule_step(28, &[("a", "11"), ("b", "11"), ("c", "7"), ("d", "0"), ("e", "2"), ("f", "2"), ("g", "22"), ("h", "97")]),
+                        // 0^inf 1100101 B> 10^28 01100 10^39 0 10^7 0 10^5 0 10^5 0 10^45 0 10^98 0^inf
+                        rule_step(15, &[("a", "12"), ("b", "0"), ("c", "19")]),
+                        // 0^inf 1100101 B> 10^32 0 10^44 0 10^4 0 10^5 0 10^5 0 10^45 0 10^98 0^inf
+                        rule_step(10, &[("a", "14"), ("b", "21"), ("c", "0"), ("n", "1")]),
+                        // 0^inf 1100101 B> 10^36 0 10^48 00 10^5 0 10^5 0 10^45 0 10^98 0^inf
+                        rule_step(29, &[("a", "16"), ("b", "23"), ("c", "2"), ("d", "1"), ("e", "20"), ("f", "97")]),
+                        // 0^inf 1100101 B> 10^8 0 10^35 0 10^53 0 10^9 0 10^41 0 10^98 0^inf
+                        rule_step(30, &[("a", "3"), ("b", "17"), ("c", "26"), ("d", "4"), ("e", "20"), ("f", "97")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^35 0 10^53 0 10^9 0 10^41 0 10^98 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "8")]),
+                        // 0^inf 1100101 B> 10^40 0 10^38 0 10^3 0 10^53 0 10^9 0 10^41 0 10^98 0^inf
+                        rule_step(19, &[("a", "18"), ("b", "18"), ("c", "26")]),
+                        // 0^inf 1100101 B> 10^44 0 10^42 1100 10^52 0 10^8 0 10^41 0 10^98 0^inf
+                        rule_step(31, &[("a", "21"), ("b", "21"), ("c", "24"), ("d", "3"), ("e", "18"), ("f", "97")]),
+                        // 0^inf 1100101 B> 10^48 01100 10^93 0 10^13 0 10^37 0 10^98 0^inf
+                        rule_step(15, &[("a", "22"), ("b", "0"), ("c", "46")]),
+                        // 0^inf 1100101 B> 10^52 0 10^98 0 10^10 0 10^37 0 10^98 0^inf
+                        rule_step(10, &[("a", "24"), ("b", "48"), ("c", "2"), ("n", "2")]),
+                        // 0^inf 1100101 B> 10^60 0 10^106 0 10^2 0 10^37 0 10^98 0^inf
+                        rule_step(32, &[("a", "28"), ("b", "52"), ("c", "18"), ("d", "97")]),
+                        // 0^inf 1100101 B> 10^64 0 10^147 0 10^97 0^inf
+                        rule_step(33, &[("a", "31"), ("b", "73"), ("c", "96")]),
+                        // 0^inf 1100101 B> 10^8 0 10^62 0 10^147 0 10^97 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "30"), ("c", "3"), ("n", "36")]),
+                        // 0^inf 1100101 B> 10^152 0 10^206 0 10^3 0 10^97 0^inf
+                        rule_step(34, &[("a", "74"), ("b", "102"), ("c", "95")]),
+                        // 0^inf 1100101 B> 10^8 0 10^151 0 10^208 1100 10^96 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "75"), ("c", "104"), ("d", "94")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^152 01100 10^303 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "38")]),
+                        // 0^inf 1100101 B> 10^160 0 10^158 001100 10^303 0^inf
+                    ]),
+                },
+                // 91: 0^inf D> 0^inf  -->  A(9, 9, 41)
+                Rule {
+                    init_config: Config::from_str("0^inf D> 0^inf").unwrap(),
+                    final_config: a("9", "9", "41"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf D> 0^inf
+                        base_step(168),
+                        // 0^inf 1100101 B> 10^3 0^inf
+                        rule_step(8, &[("a", "1")]),
+                        // 0^inf 1100101 B> 10^8 01 0^inf
+                        rule_step(9, &[("a", "3"), ("b", "0")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 01 0^inf
+                        rule_step(35, &[("a", "3"), ("b", "1")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "2")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^8 01100 10^3 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "2")]),
+                        // 0^inf 1100101 B> 10^16 0 10^14 001100 10^3 0^inf
+                        rule_step(14, &[("a", "7"), ("b", "7"), ("c", "0")]),
+                        // 0^inf 1100101 B> 10^20 01100 10^17 0 10^3 01 0^inf
+                        rule_step(15, &[("a", "8"), ("b", "0"), ("c", "8")]),
+                        // 0^inf 1100101 B> 10^24 0 10^22 001 0^inf
+                        rule_step(36, &[("a", "11"), ("b", "11")]),
+                        // 0^inf 1100101 B> 10^8 0 10^22 0 10^22 11 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "10"), ("c", "2"), ("n", "5")]),
+                        // 0^inf 1100101 B> 10^28 0 10^42 0 10^2 11 0^inf
+                        rule_step(37, &[("a", "12"), ("b", "20")]),
+                        // 0^inf 1100101 B> 10^8 0 10^27 0 10^45 0^inf
+                        rule_step(33, &[("a", "3"), ("b", "13"), ("c", "44")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^27 0 10^45 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "6")]),
+                        // 0^inf 1100101 B> 10^32 0 10^30 0 10^3 0 10^45 0^inf
+                        rule_step(34, &[("a", "14"), ("b", "14"), ("c", "43")]),
+                        // 0^inf 1100101 B> 10^8 0 10^31 0 10^32 1100 10^44 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "15"), ("c", "16"), ("d", "42")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^32 01100 10^75 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "8")]),
+                        // 0^inf 1100101 B> 10^40 0 10^38 001100 10^75 0^inf
+                    ]),
+                },
+                // 92: 0^inf E> 0^inf  -->  A(45, 45, 123)
+                Rule {
+                    init_config: Config::from_str("0^inf E> 0^inf").unwrap(),
+                    final_config: a("45", "45", "123"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf E> 0^inf
+                        base_step(350),
+                        // 0^inf 1100101 B> 10^5 0^inf
+                        rule_step(8, &[("a", "3")]),
+                        // 0^inf 1100101 B> 10^8 0 10^3 0^inf
+                        rule_step(9, &[("a", "3"), ("b", "2")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^3 0^inf
+                        rule_step(38, &[("a", "2"), ("b", "2")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 0 10^8 0^inf
+                        rule_step(33, &[("a", "3"), ("b", "3"), ("c", "7")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^7 0 10^8 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "1")]),
+                        // 0^inf 1100101 B> 10^12 0 10^10 0 10^3 0 10^8 0^inf
+                        rule_step(34, &[("a", "4"), ("b", "4"), ("c", "6")]),
+                        // 0^inf 1100101 B> 10^8 0 10^11 0 10^12 1100 10^7 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "5"), ("c", "6"), ("d", "5")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^12 01100 10^18 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "3")]),
+                        // 0^inf 1100101 B> 10^20 0 10^18 001100 10^18 0^inf
+                        rule_step(14, &[("a", "9"), ("b", "9"), ("c", "15")]),
+                        // 0^inf 1100101 B> 10^24 01100 10^21 0 10^3 0 10^16 0^inf
+                        rule_step(15, &[("a", "10"), ("b", "0"), ("c", "10")]),
+                        // 0^inf 1100101 B> 10^28 0 10^26 00 10^16 0^inf
+                        rule_step(16, &[("a", "13"), ("b", "13"), ("c", "14")]),
+                        // 0^inf 1100101 B> 10^8 0 10^26 0 10^26 1100 10^15 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "12"), ("c", "2"), ("n", "6")]),
+                        // 0^inf 1100101 B> 10^32 0 10^50 0 10^2 1100 10^15 0^inf
+                        rule_step(17, &[("a", "14"), ("b", "24"), ("c", "14")]),
+                        // 0^inf 1100101 B> 10^8 0 10^31 0 10^53 0 10^15 0^inf
+                        rule_step(18, &[("a", "3"), ("b", "15"), ("c", "26"), ("d", "14")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^31 0 10^53 0 10^15 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "7")]),
+                        // 0^inf 1100101 B> 10^36 0 10^34 0 10^3 0 10^53 0 10^15 0^inf
+                        rule_step(19, &[("a", "16"), ("b", "16"), ("c", "26")]),
+                        // 0^inf 1100101 B> 10^40 0 10^38 1100 10^52 0 10^14 0^inf
+                        rule_step(20, &[("a", "19"), ("b", "19"), ("c", "25"), ("d", "13")]),
+                        // 0^inf 1100101 B> 10^8 0 10^39 01100 10^89 0 10^14 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "17"), ("c", "44"), ("d", "10")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^35 0 10^95 0 10^11 0^inf
+                        rule_step(39, &[("a", "3"), ("b", "1"), ("c", "17"), ("d", "45"), ("e", "6")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^37 0 10^97 0 10^7 0^inf
+                        rule_step(40, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "18"), ("e", "46"), ("f", "2")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^10 01100 10^3 0 10^39 0 10^99 0 10^3 0^inf
+                        rule_step(41, &[("a", "5"), ("b", "3"), ("c", "1"), ("d", "17"), ("e", "1"), ("f", "2"), ("n", "24")]),
+                        // 0^inf 1100101 B> 10^108 01100 10^10 01100 10^51 0 10^87 0 10^3 0 10^3 0^inf
+                        rule_step(42, &[("a", "53"), ("b", "3"), ("c", "25"), ("d", "41"), ("e", "1")]),
+                        // 0^inf 1100101 B> 10^112 01100 10^9 0 10^58 0 10^86 1100 10^2 0^inf
+                        rule_step(15, &[("a", "54"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^116 0 10^14 0 10^55 0 10^86 1100 10^2 0^inf
+                        rule_step(10, &[("a", "56"), ("b", "6"), ("c", "3"), ("n", "13")]),
+                        // 0^inf 1100101 B> 10^168 0 10^66 0 10^3 0 10^86 1100 10^2 0^inf
+                        rule_step(43, &[("a", "82"), ("b", "32"), ("c", "42")]),
+                        // 0^inf 1100101 B> 10^172 0 10^70 1100 10^85 0 10^4 0^inf
+                        rule_step(15, &[("a", "84"), ("b", "35"), ("c", "42")]),
+                        // 0^inf 1100101 B> 10^176 0 10^160 01 0^inf
+                        rule_step(35, &[("a", "87"), ("b", "78")]),
+                        // 0^inf 1100101 B> 10^8 0 10^175 01100 10^158 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "87"), ("c", "0"), ("d", "156")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^176 01100 10^157 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "44")]),
+                        // 0^inf 1100101 B> 10^184 0 10^182 001100 10^157 0^inf
+                    ]),
+                },
+                // 93: A(2a, b, c)  -->  B(3a+3b+34, 16a+18b+152, c)
+                Rule {
+                    init_config: a("2a", "b", "c"),
+                    final_config: b("3a+3b+34", "16a+18b+152", "c"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^8a+4 0 10^4b+2 001100 10^c+34 0^inf
+                        rule_step(14, &[("a", "4a+1"), ("b", "2b+1"), ("c", "c+31")]),
+                        // 0^inf 1100101 B> 10^8a+8 01100 10^4b+5 0 10^3 0 10^c+32 0^inf
+                        rule_step(15, &[("a", "4a+2"), ("b", "0"), ("c", "2b+2")]),
+                        // 0^inf 1100101 B> 10^8a+12 0 10^4b+10 00 10^c+32 0^inf
+                        rule_step(16, &[("a", "4a+5"), ("b", "2b+5"), ("c", "c+30")]),
+                        // 0^inf 1100101 B> 10^8 0 10^8a+10 0 10^4b+10 1100 10^c+31 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "4a+4"), ("c", "2"), ("n", "b+2")]),
+                        // 0^inf 1100101 B> 10^4b+16 0 10^8a+4b+18 0 10^2 1100 10^c+31 0^inf
+                        rule_step(17, &[("a", "2b+6"), ("b", "4a+2b+8"), ("c", "c+30")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4b+15 0 10^8a+4b+21 0 10^c+31 0^inf
+                        rule_step(18, &[("a", "3"), ("b", "2b+7"), ("c", "4a+2b+10"), ("d", "c+30")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4b+15 0 10^8a+4b+21 0 10^c+31 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "b+3")]),
+                        // 0^inf 1100101 B> 10^4b+20 0 10^4b+18 0 10^3 0 10^8a+4b+21 0 10^c+31 0^inf
+                        rule_step(19, &[("a", "2b+8"), ("b", "2b+8"), ("c", "4a+2b+10")]),
+                        // 0^inf 1100101 B> 10^4b+24 0 10^4b+22 1100 10^8a+4b+20 0 10^c+30 0^inf
+                        rule_step(20, &[("a", "2b+11"), ("b", "2b+11"), ("c", "4a+2b+9"), ("d", "c+29")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4b+23 01100 10^8a+8b+41 0 10^c+30 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "2b+9"), ("c", "4a+4b+20"), ("d", "c+26")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4b+19 0 10^8a+8b+47 0 10^c+27 0^inf
+                        rule_step(39, &[("a", "3"), ("b", "1"), ("c", "2b+9"), ("d", "4a+4b+21"), ("e", "c+22")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^4b+21 0 10^8a+8b+49 0 10^c+23 0^inf
+                        rule_step(40, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "2b+10"), ("e", "4a+4b+22"), ("f", "c+18")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^10 01100 10^3 0 10^4b+23 0 10^8a+8b+51 0 10^c+19 0^inf
+                        rule_step(41, &[("a", "5"), ("b", "3"), ("c", "1"), ("d", "2b+9"), ("e", "1"), ("f", "c+18"), ("n", "2a+2b+12")]),
+                        // 0^inf 1100101 B> 10^8a+8b+60 01100 10^10 01100 10^4a+4b+27 0 10^4a+8b+47 0 10^3 0 10^c+19 0^inf
+                        rule_step(42, &[("a", "4a+4b+29"), ("b", "3"), ("c", "2a+2b+13"), ("d", "2a+4b+21"), ("e", "c+17")]),
+                        // 0^inf 1100101 B> 10^8a+8b+64 01100 10^9 0 10^4a+4b+34 0 10^4a+8b+46 1100 10^c+18 0^inf
+                        rule_step(15, &[("a", "4a+4b+30"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^8a+8b+68 0 10^14 0 10^4a+4b+31 0 10^4a+8b+46 1100 10^c+18 0^inf
+                        rule_step(10, &[("a", "4a+4b+32"), ("b", "6"), ("c", "3"), ("n", "a+b+7")]),
+                        // 0^inf 1100101 B> 10^12a+12b+96 0 10^4a+4b+42 0 10^3 0 10^4a+8b+46 1100 10^c+18 0^inf
+                        rule_step(44, &[("a", "6a+6b+46"), ("b", "2a+2b+20"), ("c", "2a+4b+22"), ("d", "c+15")]),
+                        // 0^inf 1100101 B> 10^12a+12b+100 0 10^4a+4b+46 1100 10^4a+8b+45 0 10^4 0 10^c+16 0^inf
+                        rule_step(15, &[("a", "6a+6b+48"), ("b", "2a+2b+23"), ("c", "2a+4b+22")]),
+                        // 0^inf 1100101 B> 10^12a+12b+104 0 10^8a+12b+96 0100 10^c+16 0^inf
+                        rule_step(45, &[("a", "6a+6b+51"), ("b", "4a+6b+47"), ("c", "c+14")]),
+                        // 0^inf 1100101 B> 10^8 0 10^12a+12b+103 01100 10^8a+12b+94 1100 10^c+15 0^inf
+                        rule_step(46, &[("a", "3"), ("b", "6a+6b+50"), ("c", "4a+6b+46"), ("d", "c+8")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^12a+12b+104 0 10^8a+12b+95 0 10^9 0 10^c+9 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "3a+3b+26")]),
+                        // 0^inf 1100101 B> 10^12a+12b+112 0 10^12a+12b+110 00 10^8a+12b+95 0 10^9 0 10^c+9 0^inf
+                        rule_step(47, &[("a", "6a+6b+54"), ("b", "6a+6b+54"), ("c", "4a+6b+47"), ("d", "3"), ("e", "c+4")]),
+                        // 0^inf 1100101 B> 10^8 0 10^12a+12b+111 0 10^20a+24b+205 0 10^13 0 10^c+5 0^inf
+                        rule_step(48, &[("a", "3"), ("b", "6a+6b+55"), ("c", "10a+12b+102"), ("d", "6"), ("e", "c+4")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^12a+12b+111 0 10^20a+24b+205 0 10^13 0 10^c+5 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "3a+3b+27")]),
+                        // 0^inf 1100101 B> 10^12a+12b+116 0 10^12a+12b+114 0 10^3 0 10^20a+24b+205 0 10^13 0 10^c+5 0^inf
+                        rule_step(19, &[("a", "6a+6b+56"), ("b", "6a+6b+56"), ("c", "10a+12b+102")]),
+                        // 0^inf 1100101 B> 10^12a+12b+120 0 10^12a+12b+118 1100 10^20a+24b+204 0 10^12 0 10^c+5 0^inf
+                        rule_step(49, &[("a", "6a+6b+59"), ("b", "6a+6b+59"), ("c", "10a+12b+100"), ("d", "5"), ("e", "c")]),
+                        // 0^inf 1100101 B> 10^12a+12b+124 01100 10^32a+36b+321 0 10^17 0 10^c+1 0^inf
+                        rule_step(15, &[("a", "6a+6b+60"), ("b", "0"), ("c", "16a+18b+160")]),
+                        // 0^inf 1100101 B> 10^12a+12b+128 0 10^32a+36b+326 0 10^14 0 10^c+1 0^inf
+                        rule_step(10, &[("a", "6a+6b+62"), ("b", "16a+18b+162"), ("c", "2"), ("n", "3")]),
+                        // 0^inf 1100101 B> 10^12a+12b+140 0 10^32a+36b+338 0 10^2 0 10^c+1 0^inf
+                    ]),
+                },
+                // 94: A(2a+1, b, c)  -->  A(3a+3b+28, 3a+3b+28, 8a+12b+c+80)
+                Rule {
+                    init_config: a("2a+1", "b", "c"),
+                    final_config: a("3a+3b+28", "3a+3b+28", "8a+12b+c+80"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^8a+8 0 10^4b+2 001100 10^c+34 0^inf
+                        rule_step(14, &[("a", "4a+3"), ("b", "2b+1"), ("c", "c+31")]),
+                        // 0^inf 1100101 B> 10^8a+12 01100 10^4b+5 0 10^3 0 10^c+32 0^inf
+                        rule_step(15, &[("a", "4a+4"), ("b", "0"), ("c", "2b+2")]),
+                        // 0^inf 1100101 B> 10^8a+16 0 10^4b+10 00 10^c+32 0^inf
+                        rule_step(16, &[("a", "4a+7"), ("b", "2b+5"), ("c", "c+30")]),
+                        // 0^inf 1100101 B> 10^8 0 10^8a+14 0 10^4b+10 1100 10^c+31 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "4a+6"), ("c", "2"), ("n", "b+2")]),
+                        // 0^inf 1100101 B> 10^4b+16 0 10^8a+4b+22 0 10^2 1100 10^c+31 0^inf
+                        rule_step(17, &[("a", "2b+6"), ("b", "4a+2b+10"), ("c", "c+30")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4b+15 0 10^8a+4b+25 0 10^c+31 0^inf
+                        rule_step(18, &[("a", "3"), ("b", "2b+7"), ("c", "4a+2b+12"), ("d", "c+30")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4b+15 0 10^8a+4b+25 0 10^c+31 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "b+3")]),
+                        // 0^inf 1100101 B> 10^4b+20 0 10^4b+18 0 10^3 0 10^8a+4b+25 0 10^c+31 0^inf
+                        rule_step(19, &[("a", "2b+8"), ("b", "2b+8"), ("c", "4a+2b+12")]),
+                        // 0^inf 1100101 B> 10^4b+24 0 10^4b+22 1100 10^8a+4b+24 0 10^c+30 0^inf
+                        rule_step(20, &[("a", "2b+11"), ("b", "2b+11"), ("c", "4a+2b+11"), ("d", "c+29")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4b+23 01100 10^8a+8b+45 0 10^c+30 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "2b+9"), ("c", "4a+4b+22"), ("d", "c+26")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4b+19 0 10^8a+8b+51 0 10^c+27 0^inf
+                        rule_step(39, &[("a", "3"), ("b", "1"), ("c", "2b+9"), ("d", "4a+4b+23"), ("e", "c+22")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^4b+21 0 10^8a+8b+53 0 10^c+23 0^inf
+                        rule_step(40, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "2b+10"), ("e", "4a+4b+24"), ("f", "c+18")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^10 01100 10^3 0 10^4b+23 0 10^8a+8b+55 0 10^c+19 0^inf
+                        rule_step(41, &[("a", "5"), ("b", "3"), ("c", "1"), ("d", "2b+9"), ("e", "1"), ("f", "c+18"), ("n", "2a+2b+13")]),
+                        // 0^inf 1100101 B> 10^8a+8b+64 01100 10^10 01100 10^4a+4b+29 0 10^4a+8b+49 0 10^3 0 10^c+19 0^inf
+                        rule_step(42, &[("a", "4a+4b+31"), ("b", "3"), ("c", "2a+2b+14"), ("d", "2a+4b+22"), ("e", "c+17")]),
+                        // 0^inf 1100101 B> 10^8a+8b+68 01100 10^9 0 10^4a+4b+36 0 10^4a+8b+48 1100 10^c+18 0^inf
+                        rule_step(15, &[("a", "4a+4b+32"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^8a+8b+72 0 10^14 0 10^4a+4b+33 0 10^4a+8b+48 1100 10^c+18 0^inf
+                        rule_step(10, &[("a", "4a+4b+34"), ("b", "6"), ("c", "1"), ("n", "a+b+8")]),
+                        // 0^inf 1100101 B> 10^12a+12b+104 0 10^4a+4b+46 0100 10^4a+8b+48 1100 10^c+18 0^inf
+                        rule_step(50, &[("a", "6a+6b+50"), ("b", "2a+2b+22"), ("c", "2a+4b+23"), ("d", "c+15")]),
+                        // 0^inf 1100101 B> 10^12a+12b+108 0 10^8a+12b+98 0 10^3 0 10^c+16 0^inf
+                        rule_step(34, &[("a", "6a+6b+52"), ("b", "4a+6b+48"), ("c", "c+14")]),
+                        // 0^inf 1100101 B> 10^8 0 10^12a+12b+107 0 10^8a+12b+100 1100 10^c+15 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "6a+6b+53"), ("c", "4a+6b+50"), ("d", "c+13")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^12a+12b+108 01100 10^8a+12b+c+114 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "3a+3b+27")]),
+                        // 0^inf 1100101 B> 10^12a+12b+116 0 10^12a+12b+114 001100 10^8a+12b+c+114 0^inf
+                    ]),
+                },
+                // 95: B(a, b, 0)  -->  A(a+4, a+4, 2b+1)
+                Rule {
+                    init_config: b("a", "b", "0"),
+                    final_config: a("a+4", "a+4", "2b+1"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^2b+34 0 10^2 01 0^inf
+                        rule_step(51, &[("a", "2a+1"), ("b", "b+16")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^2b+34 11 0^inf
+                        rule_step(52, &[("a", "2a+3"), ("b", "b+17")]),
+                        // 0^inf 1100101 B> 10^4a+12 01100 10^2b+37 0^inf
+                        rule_step(12, &[("a", "2a+5"), ("b", "0"), ("c", "2b+35")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+11 01100 10^2b+36 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "2a+5"), ("c", "0"), ("d", "2b+34")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+12 01100 10^2b+35 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+3")]),
+                        // 0^inf 1100101 B> 10^4a+20 0 10^4a+18 001100 10^2b+35 0^inf
+                    ]),
+                },
+                // 96: B(a, b, 1)  -->  A(a+3, a+3, 2b+1)
+                Rule {
+                    init_config: b("a", "b", "1"),
+                    final_config: a("a+3", "a+3", "2b+1"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^2b+34 0 10^2 0 10^2 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "b+16"), ("c", "0")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^2b+34 11001 0^inf
+                        rule_step(54, &[("a", "2a+3"), ("b", "b+16")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+7 01100 10^2b+36 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "2a+3"), ("c", "0"), ("d", "2b+34")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+8 01100 10^2b+35 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+2")]),
+                        // 0^inf 1100101 B> 10^4a+16 0 10^4a+14 001100 10^2b+35 0^inf
+                    ]),
+                },
+                // 97: B(a, b, 2)  -->  A(a+5, a+5, 2b+3)
+                Rule {
+                    init_config: b("a", "b", "2"),
+                    final_config: a("a+5", "a+5", "2b+3"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^2b+34 0 10^2 0 10^3 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "b+16"), ("c", "1")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^2b+34 1100 10^2 0^inf
+                        rule_step(55, &[("a", "2a+3"), ("b", "b+16")]),
+                        // 0^inf 1100101 B> 10^4a+12 01100 10^2b+35 0 10^4 0^inf
+                        rule_step(15, &[("a", "2a+4"), ("b", "0"), ("c", "b+17")]),
+                        // 0^inf 1100101 B> 10^4a+16 0 10^2b+40 01 0^inf
+                        rule_step(35, &[("a", "2a+7"), ("b", "b+18")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+15 01100 10^2b+38 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "2a+7"), ("c", "0"), ("d", "2b+36")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+16 01100 10^2b+37 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+4")]),
+                        // 0^inf 1100101 B> 10^4a+24 0 10^4a+22 001100 10^2b+37 0^inf
+                    ]),
+                },
+                // 98: B(a, b, 3)  -->  A(a+7, a+7, 4a+2b+21)
+                Rule {
+                    init_config: b("a", "b", "3"),
+                    final_config: a("a+7", "a+7", "4a+2b+21"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^2b+34 0 10^2 0 10^4 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "b+16"), ("c", "2")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^2b+34 1100 10^3 0^inf
+                        rule_step(56, &[("a", "2a+3"), ("b", "b+16")]),
+                        // 0^inf 1100101 B> 10^4a+12 01100 10^2b+36 01100 10^2 0^inf
+                        rule_step(57, &[("a", "2a+5"), ("b", "b+17"), ("c", "0")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+11 01100 10^2b+36 011001 0^inf
+                        rule_step(58, &[("a", "3"), ("b", "2a+5"), ("c", "b+17")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+12 01100 10^2b+36 011 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+3")]),
+                        // 0^inf 1100101 B> 10^4a+20 0 10^4a+18 001100 10^2b+36 011 0^inf
+                        rule_step(59, &[("a", "2a+9"), ("b", "2a+8"), ("c", "b+17")]),
+                        // 0^inf 1100101 B> 10^4a+24 01100 10^4a+2b+57 0^inf
+                        rule_step(12, &[("a", "2a+11"), ("b", "0"), ("c", "4a+2b+55")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+23 01100 10^4a+2b+56 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "2a+11"), ("c", "0"), ("d", "4a+2b+54")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+24 01100 10^4a+2b+55 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+6")]),
+                        // 0^inf 1100101 B> 10^4a+32 0 10^4a+30 001100 10^4a+2b+55 0^inf
+                    ]),
+                },
+                // 99: B(a, 2b, 4)  -->  A(a+2b+35, a+2b+35, 8a+12b+170)
+                Rule {
+                    init_config: b("a", "2b", "4"),
+                    final_config: a("a+2b+35", "a+2b+35", "8a+12b+170"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^4b+34 0 10^2 0 10^5 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "2b+16"), ("c", "3")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^4b+34 1100 10^4 0^inf
+                        rule_step(60, &[("a", "2a+2"), ("b", "2b+16")]),
+                        // 0^inf 1100101 B> 10^4a+12 0 10^4b+41 0 10^4 0^inf
+                        rule_step(33, &[("a", "2a+5"), ("b", "2b+20"), ("c", "3")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+10 0 10^4b+41 0 10^4 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2a+4"), ("c", "1"), ("n", "b+10")]),
+                        // 0^inf 1100101 B> 10^4b+48 0 10^4a+4b+50 0100 10^4 0^inf
+                        rule_step(45, &[("a", "2b+23"), ("b", "2a+2b+24"), ("c", "2")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4b+47 01100 10^4a+4b+48 1100 10^3 0^inf
+                        rule_step(61, &[("a", "3"), ("b", "2b+23"), ("c", "2a+2b+23")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^4b+50 01100 10^4a+4b+49 0 10^2 0^inf
+                        rule_step(62, &[("a", "5"), ("b", "2b+23"), ("c", "2a+2b+24")]),
+                        // 0^inf 1100101 B> 10^8 0 10^11 01100 10^4b+50 0 10^4a+4b+52 0^inf
+                        rule_step(63, &[("a", "3"), ("b", "5"), ("c", "2b+24"), ("d", "4a+4b+51")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^12 01100 10^4b+49 0 10^4a+4b+52 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "3")]),
+                        // 0^inf 1100101 B> 10^20 0 10^18 001100 10^4b+49 0 10^4a+4b+52 0^inf
+                        rule_step(64, &[("a", "9"), ("b", "9"), ("c", "2b+23"), ("d", "4a+4b+51")]),
+                        // 0^inf 1100101 B> 10^24 01100 10^21 0 10^3 0 10^4b+47 0 10^4a+4b+52 0^inf
+                        rule_step(15, &[("a", "10"), ("b", "0"), ("c", "10")]),
+                        // 0^inf 1100101 B> 10^28 0 10^26 00 10^4b+47 0 10^4a+4b+52 0^inf
+                        rule_step(65, &[("a", "13"), ("b", "12"), ("c", "2b+23"), ("d", "4a+4b+50")]),
+                        // 0^inf 1100101 B> 10^32 01100 10^4b+73 0 10^4a+4b+51 0^inf
+                        rule_step(15, &[("a", "14"), ("b", "0"), ("c", "2b+36")]),
+                        // 0^inf 1100101 B> 10^36 0 10^4b+78 0 10^4a+4b+48 0^inf
+                        rule_step(10, &[("a", "16"), ("b", "2b+38"), ("c", "0"), ("n", "a+b+12")]),
+                        // 0^inf 1100101 B> 10^4a+4b+84 0 10^4a+8b+126 0^inf
+                        rule_step(9, &[("a", "2a+2b+41"), ("b", "4a+8b+125")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+4b+82 0 10^4a+8b+126 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2a+2b+40"), ("c", "2"), ("n", "a+2b+31")]),
+                        // 0^inf 1100101 B> 10^4a+8b+132 0 10^8a+12b+206 0 10^2 0^inf
+                        rule_step(11, &[("a", "2a+4b+65"), ("b", "4a+6b+102")]),
+                        // 0^inf 1100101 B> 10^4a+8b+136 01100 10^8a+12b+206 0^inf
+                        rule_step(12, &[("a", "2a+4b+67"), ("b", "0"), ("c", "8a+12b+204")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+8b+135 01100 10^8a+12b+205 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "2a+4b+67"), ("c", "0"), ("d", "8a+12b+203")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+8b+136 01100 10^8a+12b+204 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+2b+34")]),
+                        // 0^inf 1100101 B> 10^4a+8b+144 0 10^4a+8b+142 001100 10^8a+12b+204 0^inf
+                    ]),
+                },
+                // 100: B(a, 2b+1, 4)  -->  A(b+13, b+13, 4a+4b+20)
+                Rule {
+                    init_config: b("a", "2b+1", "4"),
+                    final_config: a("b+13", "b+13", "4a+4b+20"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^4b+36 0 10^2 0 10^5 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "2b+17"), ("c", "3")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^4b+36 1100 10^4 0^inf
+                        rule_step(60, &[("a", "2a+2"), ("b", "2b+17")]),
+                        // 0^inf 1100101 B> 10^4a+12 0 10^4b+43 0 10^4 0^inf
+                        rule_step(33, &[("a", "2a+5"), ("b", "2b+21"), ("c", "3")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+10 0 10^4b+43 0 10^4 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2a+4"), ("c", "3"), ("n", "b+10")]),
+                        // 0^inf 1100101 B> 10^4b+48 0 10^4a+4b+50 0 10^3 0 10^4 0^inf
+                        rule_step(34, &[("a", "2b+22"), ("b", "2a+2b+24"), ("c", "2")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4b+47 0 10^4a+4b+52 1100 10^3 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "2b+23"), ("c", "2a+2b+26"), ("d", "1")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4b+48 01100 10^4a+4b+54 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "b+12")]),
+                        // 0^inf 1100101 B> 10^4b+56 0 10^4b+54 001100 10^4a+4b+54 0^inf
+                    ]),
+                },
+                // 101: B(2a, b, 5)  -->  A(3a+46, 3a+46, 20a+2b+340)
+                Rule {
+                    init_config: b("2a", "b", "5"),
+                    final_config: a("3a+46", "3a+46", "20a+2b+340"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^8a+4 0 10^2b+34 0 10^2 0 10^6 0^inf
+                        rule_step(53, &[("a", "4a+1"), ("b", "b+16"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^8a+8 01100 10^2b+34 1100 10^5 0^inf
+                        rule_step(66, &[("a", "4a+3"), ("b", "b+16")]),
+                        // 0^inf 1100101 B> 10^8a+12 01100 10^2b+36 0 10^6 0^inf
+                        rule_step(20, &[("a", "4a+5"), ("b", "0"), ("c", "b+17"), ("d", "5")]),
+                        // 0^inf 1100101 B> 10^8 0 10^8a+11 01100 10^2b+35 0 10^6 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "4a+3"), ("c", "b+17"), ("d", "2")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^8a+7 0 10^2b+41 0 10^3 0^inf
+                        rule_step(67, &[("a", "3"), ("b", "1"), ("c", "4a+3"), ("d", "b+18")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^3 0 10^8a+14 0 10^2b+40 0^inf
+                        rule_step(68, &[("a", "3"), ("b", "1"), ("c", "1"), ("d", "4a+5"), ("e", "2b+39")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^3 0 10^9 0 10^8a+11 0 10^2b+40 0^inf
+                        rule_step(69, &[("a", "3"), ("b", "1"), ("c", "1"), ("d", "2"), ("e", "4a+3"), ("f", "2b+39")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^5 0 10^11 0 10^8a+7 0 10^2b+40 0^inf
+                        rule_step(70, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "2"), ("e", "3"), ("f", "4a+1"), ("g", "2b+39")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^10 01100 10^3 0 10^7 0 10^13 0 10^8a+3 0 10^2b+40 0^inf
+                        rule_step(71, &[("a", "5"), ("b", "3"), ("c", "1"), ("d", "1"), ("e", "0"), ("f", "4a+1"), ("g", "2b+39"), ("n", "3")]),
+                        // 0^inf 1100101 B> 10^24 01100 10^10 01100 10^9 0 10^13 0100 10^8a+3 0 10^2b+40 0^inf
+                        rule_step(72, &[("a", "11"), ("b", "3"), ("c", "4"), ("d", "4"), ("e", "4a+1"), ("f", "2b+38")]),
+                        // 0^inf 1100101 B> 10^28 01100 10^9 0 10^16 0 10^8a+15 0 10^2b+39 0^inf
+                        rule_step(15, &[("a", "12"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^32 0 10^14 0 10^13 0 10^8a+15 0 10^2b+39 0^inf
+                        rule_step(10, &[("a", "14"), ("b", "6"), ("c", "1"), ("n", "3")]),
+                        // 0^inf 1100101 B> 10^44 0 10^26 0100 10^8a+15 0 10^2b+39 0^inf
+                        rule_step(73, &[("a", "20"), ("b", "12"), ("c", "4a+7"), ("d", "2b+37")]),
+                        // 0^inf 1100101 B> 10^8 0 10^43 0 10^8a+43 0 10^2b+38 0^inf
+                        rule_step(18, &[("a", "3"), ("b", "21"), ("c", "4a+21"), ("d", "2b+37")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^43 0 10^8a+43 0 10^2b+38 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "10")]),
+                        // 0^inf 1100101 B> 10^48 0 10^46 0 10^3 0 10^8a+43 0 10^2b+38 0^inf
+                        rule_step(19, &[("a", "22"), ("b", "22"), ("c", "4a+21")]),
+                        // 0^inf 1100101 B> 10^52 0 10^50 1100 10^8a+42 0 10^2b+37 0^inf
+                        rule_step(20, &[("a", "25"), ("b", "25"), ("c", "4a+20"), ("d", "2b+36")]),
+                        // 0^inf 1100101 B> 10^8 0 10^51 01100 10^8a+91 0 10^2b+37 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "23"), ("c", "4a+45"), ("d", "2b+33")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^47 0 10^8a+97 0 10^2b+34 0^inf
+                        rule_step(39, &[("a", "3"), ("b", "1"), ("c", "23"), ("d", "4a+46"), ("e", "2b+29")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^49 0 10^8a+99 0 10^2b+30 0^inf
+                        rule_step(40, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "24"), ("e", "4a+47"), ("f", "2b+25")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^10 01100 10^3 0 10^51 0 10^8a+101 0 10^2b+26 0^inf
+                        rule_step(41, &[("a", "5"), ("b", "3"), ("c", "1"), ("d", "23"), ("e", "0"), ("f", "2b+25"), ("n", "2a+25")]),
+                        // 0^inf 1100101 B> 10^8a+112 01100 10^10 01100 10^4a+53 0 10^4a+101 0100 10^2b+26 0^inf
+                        rule_step(74, &[("a", "4a+55"), ("b", "3"), ("c", "2a+26"), ("d", "2a+48"), ("e", "2b+24")]),
+                        // 0^inf 1100101 B> 10^8a+116 01100 10^9 0 10^4a+60 01100 10^4a+96 1100 10^2b+25 0^inf
+                        rule_step(15, &[("a", "4a+56"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^8a+120 0 10^14 0 10^4a+57 01100 10^4a+96 1100 10^2b+25 0^inf
+                        rule_step(10, &[("a", "4a+58"), ("b", "6"), ("c", "1"), ("n", "a+14")]),
+                        // 0^inf 1100101 B> 10^12a+176 0 10^4a+70 01001100 10^4a+96 1100 10^2b+25 0^inf
+                        rule_step(75, &[("a", "6a+86"), ("b", "2a+34"), ("c", "2a+47"), ("d", "2b+25")]),
+                        // 0^inf 1100101 B> 10^8 0 10^12a+175 0 10^8a+2b+196 0^inf
+                        rule_step(33, &[("a", "3"), ("b", "6a+87"), ("c", "8a+2b+195")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^12a+175 0 10^8a+2b+196 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "3a+43")]),
+                        // 0^inf 1100101 B> 10^12a+180 0 10^12a+178 0 10^3 0 10^8a+2b+196 0^inf
+                        rule_step(34, &[("a", "6a+88"), ("b", "6a+88"), ("c", "8a+2b+194")]),
+                        // 0^inf 1100101 B> 10^8 0 10^12a+179 0 10^12a+180 1100 10^8a+2b+195 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "6a+89"), ("c", "6a+90"), ("d", "8a+2b+193")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^12a+180 01100 10^20a+2b+374 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "3a+45")]),
+                        // 0^inf 1100101 B> 10^12a+188 0 10^12a+186 001100 10^20a+2b+374 0^inf
+                    ]),
+                },
+                // 102: B(2a+1, b, 5)  -->  A(3a+47, 3a+47, 8a+2b+163)
+                Rule {
+                    init_config: b("2a+1", "b", "5"),
+                    final_config: a("3a+47", "3a+47", "8a+2b+163"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^8a+8 0 10^2b+34 0 10^2 0 10^6 0^inf
+                        rule_step(53, &[("a", "4a+3"), ("b", "b+16"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^8a+12 01100 10^2b+34 1100 10^5 0^inf
+                        rule_step(66, &[("a", "4a+5"), ("b", "b+16")]),
+                        // 0^inf 1100101 B> 10^8a+16 01100 10^2b+36 0 10^6 0^inf
+                        rule_step(20, &[("a", "4a+7"), ("b", "0"), ("c", "b+17"), ("d", "5")]),
+                        // 0^inf 1100101 B> 10^8 0 10^8a+15 01100 10^2b+35 0 10^6 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "4a+5"), ("c", "b+17"), ("d", "2")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^8a+11 0 10^2b+41 0 10^3 0^inf
+                        rule_step(67, &[("a", "3"), ("b", "1"), ("c", "4a+5"), ("d", "b+18")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^3 0 10^8a+18 0 10^2b+40 0^inf
+                        rule_step(68, &[("a", "3"), ("b", "1"), ("c", "1"), ("d", "4a+7"), ("e", "2b+39")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^3 0 10^9 0 10^8a+15 0 10^2b+40 0^inf
+                        rule_step(69, &[("a", "3"), ("b", "1"), ("c", "1"), ("d", "2"), ("e", "4a+5"), ("f", "2b+39")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^5 0 10^11 0 10^8a+11 0 10^2b+40 0^inf
+                        rule_step(70, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "2"), ("e", "3"), ("f", "4a+3"), ("g", "2b+39")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^10 01100 10^3 0 10^7 0 10^13 0 10^8a+7 0 10^2b+40 0^inf
+                        rule_step(71, &[("a", "5"), ("b", "3"), ("c", "1"), ("d", "1"), ("e", "0"), ("f", "4a+3"), ("g", "2b+39"), ("n", "3")]),
+                        // 0^inf 1100101 B> 10^24 01100 10^10 01100 10^9 0 10^13 0100 10^8a+7 0 10^2b+40 0^inf
+                        rule_step(72, &[("a", "11"), ("b", "3"), ("c", "4"), ("d", "4"), ("e", "4a+3"), ("f", "2b+38")]),
+                        // 0^inf 1100101 B> 10^28 01100 10^9 0 10^16 0 10^8a+19 0 10^2b+39 0^inf
+                        rule_step(15, &[("a", "12"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^32 0 10^14 0 10^13 0 10^8a+19 0 10^2b+39 0^inf
+                        rule_step(10, &[("a", "14"), ("b", "6"), ("c", "1"), ("n", "3")]),
+                        // 0^inf 1100101 B> 10^44 0 10^26 0100 10^8a+19 0 10^2b+39 0^inf
+                        rule_step(73, &[("a", "20"), ("b", "12"), ("c", "4a+9"), ("d", "2b+37")]),
+                        // 0^inf 1100101 B> 10^8 0 10^43 0 10^8a+47 0 10^2b+38 0^inf
+                        rule_step(18, &[("a", "3"), ("b", "21"), ("c", "4a+23"), ("d", "2b+37")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^43 0 10^8a+47 0 10^2b+38 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "10")]),
+                        // 0^inf 1100101 B> 10^48 0 10^46 0 10^3 0 10^8a+47 0 10^2b+38 0^inf
+                        rule_step(19, &[("a", "22"), ("b", "22"), ("c", "4a+23")]),
+                        // 0^inf 1100101 B> 10^52 0 10^50 1100 10^8a+46 0 10^2b+37 0^inf
+                        rule_step(20, &[("a", "25"), ("b", "25"), ("c", "4a+22"), ("d", "2b+36")]),
+                        // 0^inf 1100101 B> 10^8 0 10^51 01100 10^8a+95 0 10^2b+37 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "23"), ("c", "4a+47"), ("d", "2b+33")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^47 0 10^8a+101 0 10^2b+34 0^inf
+                        rule_step(39, &[("a", "3"), ("b", "1"), ("c", "23"), ("d", "4a+48"), ("e", "2b+29")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^49 0 10^8a+103 0 10^2b+30 0^inf
+                        rule_step(40, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "24"), ("e", "4a+49"), ("f", "2b+25")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^10 01100 10^3 0 10^51 0 10^8a+105 0 10^2b+26 0^inf
+                        rule_step(41, &[("a", "5"), ("b", "3"), ("c", "1"), ("d", "23"), ("e", "0"), ("f", "2b+25"), ("n", "2a+26")]),
+                        // 0^inf 1100101 B> 10^8a+116 01100 10^10 01100 10^4a+55 0 10^4a+103 0100 10^2b+26 0^inf
+                        rule_step(74, &[("a", "4a+57"), ("b", "3"), ("c", "2a+27"), ("d", "2a+49"), ("e", "2b+24")]),
+                        // 0^inf 1100101 B> 10^8a+120 01100 10^9 0 10^4a+62 01100 10^4a+98 1100 10^2b+25 0^inf
+                        rule_step(15, &[("a", "4a+58"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^8a+124 0 10^14 0 10^4a+59 01100 10^4a+98 1100 10^2b+25 0^inf
+                        rule_step(10, &[("a", "4a+60"), ("b", "6"), ("c", "3"), ("n", "a+14")]),
+                        // 0^inf 1100101 B> 10^12a+180 0 10^4a+70 0 10^3 01100 10^4a+98 1100 10^2b+25 0^inf
+                        rule_step(76, &[("a", "6a+88"), ("b", "2a+34"), ("c", "2a+48"), ("d", "2b+25")]),
+                        // 0^inf 1100101 B> 10^12a+184 0 10^4a+74 1100 10^4a+2b+125 0^inf
+                        rule_step(12, &[("a", "6a+91"), ("b", "2a+37"), ("c", "4a+2b+123")]),
+                        // 0^inf 1100101 B> 10^8 0 10^12a+183 01100 10^8a+2b+198 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "6a+91"), ("c", "0"), ("d", "8a+2b+196")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^12a+184 01100 10^8a+2b+197 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "3a+46")]),
+                        // 0^inf 1100101 B> 10^12a+192 0 10^12a+190 001100 10^8a+2b+197 0^inf
+                    ]),
+                },
+                // 103: B(a, 2b, 6)  -->  A(a+b+24, a+b+24, 8a+4b+74)
+                Rule {
+                    init_config: b("a", "2b", "6"),
+                    final_config: a("a+b+24", "a+b+24", "8a+4b+74"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^4b+34 0 10^2 0 10^7 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "2b+16"), ("c", "5")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^4b+34 1100 10^6 0^inf
+                        rule_step(77, &[("a", "2a+2"), ("b", "2b+16")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+7 0 10^4b+35 0 10^9 0^inf
+                        rule_step(18, &[("a", "3"), ("b", "2a+3"), ("c", "2b+17"), ("d", "8")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+7 0 10^4b+35 0 10^9 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "a+1")]),
+                        // 0^inf 1100101 B> 10^4a+12 0 10^4a+10 0 10^3 0 10^4b+35 0 10^9 0^inf
+                        rule_step(19, &[("a", "2a+4"), ("b", "2a+4"), ("c", "2b+17")]),
+                        // 0^inf 1100101 B> 10^4a+16 0 10^4a+14 1100 10^4b+34 0 10^8 0^inf
+                        rule_step(20, &[("a", "2a+7"), ("b", "2a+7"), ("c", "2b+16"), ("d", "7")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+15 01100 10^4a+4b+47 0 10^8 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "2a+5"), ("c", "2a+2b+23"), ("d", "4")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4a+11 0 10^4a+4b+53 0 10^5 0^inf
+                        rule_step(39, &[("a", "3"), ("b", "1"), ("c", "2a+5"), ("d", "2a+2b+24"), ("e", "0")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^4a+13 0 10^4a+4b+55 01 0^inf
+                        rule_step(78, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "2a+6"), ("e", "2a+2b+24")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^9 0 10^4 01100 10^4a+19 0 10^4a+4b+50 0^inf
+                        rule_step(15, &[("a", "4"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^16 0 10^14 01001100 10^4a+19 0 10^4a+4b+50 0^inf
+                        rule_step(79, &[("a", "6"), ("b", "6"), ("c", "2a+8"), ("d", "4a+4b+49")]),
+                        // 0^inf 1100101 B> 10^8 0 10^15 0 10^19 0 10^3 0 10^4a+17 0 10^4a+4b+50 0^inf
+                        rule_step(30, &[("a", "3"), ("b", "7"), ("c", "9"), ("d", "1"), ("e", "2a+8"), ("f", "4a+4b+49")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^15 0 10^19 0 10^3 0 10^4a+17 0 10^4a+4b+50 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "3")]),
+                        // 0^inf 1100101 B> 10^20 0 10^18 0 10^3 0 10^19 0 10^3 0 10^4a+17 0 10^4a+4b+50 0^inf
+                        rule_step(19, &[("a", "8"), ("b", "8"), ("c", "9")]),
+                        // 0^inf 1100101 B> 10^24 0 10^22 1100 10^18 0 10^2 0 10^4a+17 0 10^4a+4b+50 0^inf
+                        rule_step(80, &[("a", "11"), ("b", "11"), ("c", "7"), ("d", "2a+6"), ("e", "4a+4b+49")]),
+                        // 0^inf 1100101 B> 10^28 01100 10^39 0 10^7 0 10^4a+13 0 10^4a+4b+50 0^inf
+                        rule_step(15, &[("a", "12"), ("b", "0"), ("c", "19")]),
+                        // 0^inf 1100101 B> 10^32 0 10^44 0 10^4 0 10^4a+13 0 10^4a+4b+50 0^inf
+                        rule_step(10, &[("a", "14"), ("b", "21"), ("c", "0"), ("n", "1")]),
+                        // 0^inf 1100101 B> 10^36 0 10^48 00 10^4a+13 0 10^4a+4b+50 0^inf
+                        rule_step(65, &[("a", "17"), ("b", "23"), ("c", "2a+6"), ("d", "4a+4b+48")]),
+                        // 0^inf 1100101 B> 10^40 01100 10^4a+61 0 10^4a+4b+49 0^inf
+                        rule_step(15, &[("a", "18"), ("b", "0"), ("c", "2a+30")]),
+                        // 0^inf 1100101 B> 10^44 0 10^4a+66 0 10^4a+4b+46 0^inf
+                        rule_step(10, &[("a", "20"), ("b", "2a+32"), ("c", "2"), ("n", "a+b+11")]),
+                        // 0^inf 1100101 B> 10^4a+4b+88 0 10^8a+4b+110 0 10^2 0^inf
+                        rule_step(11, &[("a", "2a+2b+43"), ("b", "4a+2b+54")]),
+                        // 0^inf 1100101 B> 10^4a+4b+92 01100 10^8a+4b+110 0^inf
+                        rule_step(12, &[("a", "2a+2b+45"), ("b", "0"), ("c", "8a+4b+108")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+4b+91 01100 10^8a+4b+109 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "2a+2b+45"), ("c", "0"), ("d", "8a+4b+107")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+4b+92 01100 10^8a+4b+108 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+b+23")]),
+                        // 0^inf 1100101 B> 10^4a+4b+100 0 10^4a+4b+98 001100 10^8a+4b+108 0^inf
+                    ]),
+                },
+                // 104: B(a, 2b+1, 6)  -->  A(2a+b+32, 2a+b+32, 12a+8b+166)
+                Rule {
+                    init_config: b("a", "2b+1", "6"),
+                    final_config: a("2a+b+32", "2a+b+32", "12a+8b+166"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^4b+36 0 10^2 0 10^7 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "2b+17"), ("c", "5")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^4b+36 1100 10^6 0^inf
+                        rule_step(77, &[("a", "2a+2"), ("b", "2b+17")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+7 0 10^4b+37 0 10^9 0^inf
+                        rule_step(18, &[("a", "3"), ("b", "2a+3"), ("c", "2b+18"), ("d", "8")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+7 0 10^4b+37 0 10^9 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "a+1")]),
+                        // 0^inf 1100101 B> 10^4a+12 0 10^4a+10 0 10^3 0 10^4b+37 0 10^9 0^inf
+                        rule_step(19, &[("a", "2a+4"), ("b", "2a+4"), ("c", "2b+18")]),
+                        // 0^inf 1100101 B> 10^4a+16 0 10^4a+14 1100 10^4b+36 0 10^8 0^inf
+                        rule_step(20, &[("a", "2a+7"), ("b", "2a+7"), ("c", "2b+17"), ("d", "7")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+15 01100 10^4a+4b+49 0 10^8 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "2a+5"), ("c", "2a+2b+24"), ("d", "4")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4a+11 0 10^4a+4b+55 0 10^5 0^inf
+                        rule_step(39, &[("a", "3"), ("b", "1"), ("c", "2a+5"), ("d", "2a+2b+25"), ("e", "0")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^4a+13 0 10^4a+4b+57 01 0^inf
+                        rule_step(78, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "2a+6"), ("e", "2a+2b+25")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^9 0 10^4 01100 10^4a+19 0 10^4a+4b+52 0^inf
+                        rule_step(15, &[("a", "4"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^16 0 10^14 01001100 10^4a+19 0 10^4a+4b+52 0^inf
+                        rule_step(79, &[("a", "6"), ("b", "6"), ("c", "2a+8"), ("d", "4a+4b+51")]),
+                        // 0^inf 1100101 B> 10^8 0 10^15 0 10^19 0 10^3 0 10^4a+17 0 10^4a+4b+52 0^inf
+                        rule_step(30, &[("a", "3"), ("b", "7"), ("c", "9"), ("d", "1"), ("e", "2a+8"), ("f", "4a+4b+51")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^15 0 10^19 0 10^3 0 10^4a+17 0 10^4a+4b+52 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "3")]),
+                        // 0^inf 1100101 B> 10^20 0 10^18 0 10^3 0 10^19 0 10^3 0 10^4a+17 0 10^4a+4b+52 0^inf
+                        rule_step(19, &[("a", "8"), ("b", "8"), ("c", "9")]),
+                        // 0^inf 1100101 B> 10^24 0 10^22 1100 10^18 0 10^2 0 10^4a+17 0 10^4a+4b+52 0^inf
+                        rule_step(80, &[("a", "11"), ("b", "11"), ("c", "7"), ("d", "2a+6"), ("e", "4a+4b+51")]),
+                        // 0^inf 1100101 B> 10^28 01100 10^39 0 10^7 0 10^4a+13 0 10^4a+4b+52 0^inf
+                        rule_step(15, &[("a", "12"), ("b", "0"), ("c", "19")]),
+                        // 0^inf 1100101 B> 10^32 0 10^44 0 10^4 0 10^4a+13 0 10^4a+4b+52 0^inf
+                        rule_step(10, &[("a", "14"), ("b", "21"), ("c", "0"), ("n", "1")]),
+                        // 0^inf 1100101 B> 10^36 0 10^48 00 10^4a+13 0 10^4a+4b+52 0^inf
+                        rule_step(65, &[("a", "17"), ("b", "23"), ("c", "2a+6"), ("d", "4a+4b+50")]),
+                        // 0^inf 1100101 B> 10^40 01100 10^4a+61 0 10^4a+4b+51 0^inf
+                        rule_step(15, &[("a", "18"), ("b", "0"), ("c", "2a+30")]),
+                        // 0^inf 1100101 B> 10^44 0 10^4a+66 0 10^4a+4b+48 0^inf
+                        rule_step(10, &[("a", "20"), ("b", "2a+32"), ("c", "0"), ("n", "a+b+12")]),
+                        // 0^inf 1100101 B> 10^4a+4b+92 0 10^8a+4b+114 0^inf
+                        rule_step(9, &[("a", "2a+2b+45"), ("b", "8a+4b+113")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+4b+90 0 10^8a+4b+114 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2a+2b+44"), ("c", "2"), ("n", "2a+b+28")]),
+                        // 0^inf 1100101 B> 10^8a+4b+120 0 10^12a+8b+202 0 10^2 0^inf
+                        rule_step(11, &[("a", "4a+2b+59"), ("b", "6a+4b+100")]),
+                        // 0^inf 1100101 B> 10^8a+4b+124 01100 10^12a+8b+202 0^inf
+                        rule_step(12, &[("a", "4a+2b+61"), ("b", "0"), ("c", "12a+8b+200")]),
+                        // 0^inf 1100101 B> 10^8 0 10^8a+4b+123 01100 10^12a+8b+201 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "4a+2b+61"), ("c", "0"), ("d", "12a+8b+199")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^8a+4b+124 01100 10^12a+8b+200 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "2a+b+31")]),
+                        // 0^inf 1100101 B> 10^8a+4b+132 0 10^8a+4b+130 001100 10^12a+8b+200 0^inf
+                    ]),
+                },
+                // 105: B(a, b, 7)  -->  A(a+10, a+10, 8a+2b+42)
+                Rule {
+                    init_config: b("a", "b", "7"),
+                    final_config: a("a+10", "a+10", "8a+2b+42"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^2b+34 0 10^2 0 10^8 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "b+16"), ("c", "6")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^2b+34 1100 10^7 0^inf
+                        rule_step(81, &[("a", "2a+2"), ("b", "b+16"), ("c", "0")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+7 0 10^2b+35 0 10^9 01 0^inf
+                        rule_step(48, &[("a", "3"), ("b", "2a+3"), ("c", "b+17"), ("d", "4"), ("e", "0")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+7 0 10^2b+35 0 10^9 01 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "a+1")]),
+                        // 0^inf 1100101 B> 10^4a+12 0 10^4a+10 0 10^3 0 10^2b+35 0 10^9 01 0^inf
+                        rule_step(19, &[("a", "2a+4"), ("b", "2a+4"), ("c", "b+17")]),
+                        // 0^inf 1100101 B> 10^4a+16 0 10^4a+14 1100 10^2b+34 0 10^8 01 0^inf
+                        rule_step(82, &[("a", "2a+7"), ("b", "2a+7"), ("c", "b+16"), ("d", "2")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+15 01100 10^4a+2b+48 01100 10^6 0^inf
+                        rule_step(83, &[("a", "3"), ("b", "2a+7"), ("c", "2a+b+23"), ("d", "4")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+16 01100 10^4a+2b+48 01100 10^5 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+4")]),
+                        // 0^inf 1100101 B> 10^4a+24 0 10^4a+22 001100 10^4a+2b+48 01100 10^5 0^inf
+                        rule_step(84, &[("a", "2a+11"), ("b", "2a+10"), ("c", "2a+b+23"), ("d", "4")]),
+                        // 0^inf 1100101 B> 10^4a+28 01100 10^8a+2b+73 0 10^5 0^inf
+                        rule_step(15, &[("a", "2a+12"), ("b", "0"), ("c", "4a+b+36")]),
+                        // 0^inf 1100101 B> 10^4a+32 0 10^8a+2b+78 0 10^2 0^inf
+                        rule_step(11, &[("a", "2a+15"), ("b", "4a+b+38")]),
+                        // 0^inf 1100101 B> 10^4a+36 01100 10^8a+2b+78 0^inf
+                        rule_step(12, &[("a", "2a+17"), ("b", "0"), ("c", "8a+2b+76")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+35 01100 10^8a+2b+77 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "2a+17"), ("c", "0"), ("d", "8a+2b+75")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+36 01100 10^8a+2b+76 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+9")]),
+                        // 0^inf 1100101 B> 10^4a+44 0 10^4a+42 001100 10^8a+2b+76 0^inf
+                    ]),
+                },
+                // 106: B(a, 2b, 8)  -->  A(2a+b+26, 2a+b+26, 12a+4b+82)
+                Rule {
+                    init_config: b("a", "2b", "8"),
+                    final_config: a("2a+b+26", "2a+b+26", "12a+4b+82"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^4b+34 0 10^2 0 10^9 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "2b+16"), ("c", "7")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^4b+34 1100 10^8 0^inf
+                        rule_step(81, &[("a", "2a+2"), ("b", "2b+16"), ("c", "1")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+7 0 10^4b+35 0 10^9 0 10^2 0^inf
+                        rule_step(48, &[("a", "3"), ("b", "2a+3"), ("c", "2b+17"), ("d", "4"), ("e", "1")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+7 0 10^4b+35 0 10^9 0 10^2 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "a+1")]),
+                        // 0^inf 1100101 B> 10^4a+12 0 10^4a+10 0 10^3 0 10^4b+35 0 10^9 0 10^2 0^inf
+                        rule_step(19, &[("a", "2a+4"), ("b", "2a+4"), ("c", "2b+17")]),
+                        // 0^inf 1100101 B> 10^4a+16 0 10^4a+14 1100 10^4b+34 0 10^8 0 10^2 0^inf
+                        rule_step(85, &[("a", "2a+6"), ("b", "2a+7"), ("c", "2b+16"), ("d", "3")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+15 0 10^4a+4b+53 0 10^8 0^inf
+                        rule_step(18, &[("a", "3"), ("b", "2a+7"), ("c", "2a+2b+26"), ("d", "7")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+15 0 10^4a+4b+53 0 10^8 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "a+3")]),
+                        // 0^inf 1100101 B> 10^4a+20 0 10^4a+18 0 10^3 0 10^4a+4b+53 0 10^8 0^inf
+                        rule_step(19, &[("a", "2a+8"), ("b", "2a+8"), ("c", "2a+2b+26")]),
+                        // 0^inf 1100101 B> 10^4a+24 0 10^4a+22 1100 10^4a+4b+52 0 10^7 0^inf
+                        rule_step(20, &[("a", "2a+11"), ("b", "2a+11"), ("c", "2a+2b+25"), ("d", "6")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+23 01100 10^8a+4b+73 0 10^7 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "2a+9"), ("c", "4a+2b+36"), ("d", "3")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4a+19 0 10^8a+4b+79 0 10^4 0^inf
+                        rule_step(86, &[("a", "3"), ("b", "1"), ("c", "2a+9"), ("d", "4a+2b+37")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^4a+21 0 10^8a+4b+81 0^inf
+                        rule_step(87, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "2a+10"), ("e", "8a+4b+77")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^9 0 10^3 0 10^4a+27 0 10^8a+4b+78 0^inf
+                        rule_step(15, &[("a", "4"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^16 0 10^14 00 10^4a+27 0 10^8a+4b+78 0^inf
+                        rule_step(65, &[("a", "7"), ("b", "6"), ("c", "2a+13"), ("d", "8a+4b+76")]),
+                        // 0^inf 1100101 B> 10^20 01100 10^4a+41 0 10^8a+4b+77 0^inf
+                        rule_step(15, &[("a", "8"), ("b", "0"), ("c", "2a+20")]),
+                        // 0^inf 1100101 B> 10^24 0 10^4a+46 0 10^8a+4b+74 0^inf
+                        rule_step(10, &[("a", "10"), ("b", "2a+22"), ("c", "2"), ("n", "2a+b+18")]),
+                        // 0^inf 1100101 B> 10^8a+4b+96 0 10^12a+4b+118 0 10^2 0^inf
+                        rule_step(11, &[("a", "4a+2b+47"), ("b", "6a+2b+58")]),
+                        // 0^inf 1100101 B> 10^8a+4b+100 01100 10^12a+4b+118 0^inf
+                        rule_step(12, &[("a", "4a+2b+49"), ("b", "0"), ("c", "12a+4b+116")]),
+                        // 0^inf 1100101 B> 10^8 0 10^8a+4b+99 01100 10^12a+4b+117 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "4a+2b+49"), ("c", "0"), ("d", "12a+4b+115")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^8a+4b+100 01100 10^12a+4b+116 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "2a+b+25")]),
+                        // 0^inf 1100101 B> 10^8a+4b+108 0 10^8a+4b+106 001100 10^12a+4b+116 0^inf
+                    ]),
+                },
+                // 107: B(a, 2b+1, 8)  -->  A(3a+b+34, 3a+b+34, 20a+8b+182)
+                Rule {
+                    init_config: b("a", "2b+1", "8"),
+                    final_config: a("3a+b+34", "3a+b+34", "20a+8b+182"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^4b+36 0 10^2 0 10^9 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "2b+17"), ("c", "7")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^4b+36 1100 10^8 0^inf
+                        rule_step(81, &[("a", "2a+2"), ("b", "2b+17"), ("c", "1")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+7 0 10^4b+37 0 10^9 0 10^2 0^inf
+                        rule_step(48, &[("a", "3"), ("b", "2a+3"), ("c", "2b+18"), ("d", "4"), ("e", "1")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+7 0 10^4b+37 0 10^9 0 10^2 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "a+1")]),
+                        // 0^inf 1100101 B> 10^4a+12 0 10^4a+10 0 10^3 0 10^4b+37 0 10^9 0 10^2 0^inf
+                        rule_step(19, &[("a", "2a+4"), ("b", "2a+4"), ("c", "2b+18")]),
+                        // 0^inf 1100101 B> 10^4a+16 0 10^4a+14 1100 10^4b+36 0 10^8 0 10^2 0^inf
+                        rule_step(85, &[("a", "2a+6"), ("b", "2a+7"), ("c", "2b+17"), ("d", "3")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+15 0 10^4a+4b+55 0 10^8 0^inf
+                        rule_step(18, &[("a", "3"), ("b", "2a+7"), ("c", "2a+2b+27"), ("d", "7")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+15 0 10^4a+4b+55 0 10^8 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "a+3")]),
+                        // 0^inf 1100101 B> 10^4a+20 0 10^4a+18 0 10^3 0 10^4a+4b+55 0 10^8 0^inf
+                        rule_step(19, &[("a", "2a+8"), ("b", "2a+8"), ("c", "2a+2b+27")]),
+                        // 0^inf 1100101 B> 10^4a+24 0 10^4a+22 1100 10^4a+4b+54 0 10^7 0^inf
+                        rule_step(20, &[("a", "2a+11"), ("b", "2a+11"), ("c", "2a+2b+26"), ("d", "6")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+23 01100 10^8a+4b+75 0 10^7 0^inf
+                        rule_step(21, &[("a", "3"), ("b", "2a+9"), ("c", "4a+2b+37"), ("d", "3")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4a+19 0 10^8a+4b+81 0 10^4 0^inf
+                        rule_step(86, &[("a", "3"), ("b", "1"), ("c", "2a+9"), ("d", "4a+2b+38")]),
+                        // 0^inf 1100101 B> 10^8 0 10^7 01100 10^4 01100 10^4a+21 0 10^8a+4b+83 0^inf
+                        rule_step(87, &[("a", "3"), ("b", "3"), ("c", "0"), ("d", "2a+10"), ("e", "8a+4b+79")]),
+                        // 0^inf 1100101 B> 10^12 01100 10^9 0 10^3 0 10^4a+27 0 10^8a+4b+80 0^inf
+                        rule_step(15, &[("a", "4"), ("b", "0"), ("c", "4")]),
+                        // 0^inf 1100101 B> 10^16 0 10^14 00 10^4a+27 0 10^8a+4b+80 0^inf
+                        rule_step(65, &[("a", "7"), ("b", "6"), ("c", "2a+13"), ("d", "8a+4b+78")]),
+                        // 0^inf 1100101 B> 10^20 01100 10^4a+41 0 10^8a+4b+79 0^inf
+                        rule_step(15, &[("a", "8"), ("b", "0"), ("c", "2a+20")]),
+                        // 0^inf 1100101 B> 10^24 0 10^4a+46 0 10^8a+4b+76 0^inf
+                        rule_step(10, &[("a", "10"), ("b", "2a+22"), ("c", "0"), ("n", "2a+b+19")]),
+                        // 0^inf 1100101 B> 10^8a+4b+100 0 10^12a+4b+122 0^inf
+                        rule_step(9, &[("a", "4a+2b+49"), ("b", "12a+4b+121")]),
+                        // 0^inf 1100101 B> 10^8 0 10^8a+4b+98 0 10^12a+4b+122 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "4a+2b+48"), ("c", "2"), ("n", "3a+b+30")]),
+                        // 0^inf 1100101 B> 10^12a+4b+128 0 10^20a+8b+218 0 10^2 0^inf
+                        rule_step(11, &[("a", "6a+2b+63"), ("b", "10a+4b+108")]),
+                        // 0^inf 1100101 B> 10^12a+4b+132 01100 10^20a+8b+218 0^inf
+                        rule_step(12, &[("a", "6a+2b+65"), ("b", "0"), ("c", "20a+8b+216")]),
+                        // 0^inf 1100101 B> 10^8 0 10^12a+4b+131 01100 10^20a+8b+217 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "6a+2b+65"), ("c", "0"), ("d", "20a+8b+215")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^12a+4b+132 01100 10^20a+8b+216 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "3a+b+33")]),
+                        // 0^inf 1100101 B> 10^12a+4b+140 0 10^12a+4b+138 001100 10^20a+8b+216 0^inf
+                    ]),
+                },
+                // 108: B(a, b, 9)  -->  A(a+13, a+13, 8a+2b+48)
+                Rule {
+                    init_config: b("a", "b", "9"),
+                    final_config: a("a+13", "a+13", "8a+2b+48"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^2b+34 0 10^2 0 10^10 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "b+16"), ("c", "8")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^2b+34 1100 10^9 0^inf
+                        rule_step(81, &[("a", "2a+2"), ("b", "b+16"), ("c", "2")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+7 0 10^2b+35 0 10^9 0 10^3 0^inf
+                        rule_step(48, &[("a", "3"), ("b", "2a+3"), ("c", "b+17"), ("d", "4"), ("e", "2")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+7 0 10^2b+35 0 10^9 0 10^3 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "a+1")]),
+                        // 0^inf 1100101 B> 10^4a+12 0 10^4a+10 0 10^3 0 10^2b+35 0 10^9 0 10^3 0^inf
+                        rule_step(19, &[("a", "2a+4"), ("b", "2a+4"), ("c", "b+17")]),
+                        // 0^inf 1100101 B> 10^4a+16 0 10^4a+14 1100 10^2b+34 0 10^8 0 10^3 0^inf
+                        rule_step(88, &[("a", "2a+7"), ("b", "2a+7"), ("c", "b+15"), ("d", "3")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+15 01100 10^4a+2b+48 0 10^10 0^inf
+                        rule_step(63, &[("a", "3"), ("b", "2a+7"), ("c", "2a+b+23"), ("d", "9")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+16 01100 10^4a+2b+47 0 10^10 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+4")]),
+                        // 0^inf 1100101 B> 10^4a+24 0 10^4a+22 001100 10^4a+2b+47 0 10^10 0^inf
+                        rule_step(64, &[("a", "2a+11"), ("b", "2a+11"), ("c", "2a+b+22"), ("d", "9")]),
+                        // 0^inf 1100101 B> 10^4a+28 01100 10^4a+25 0 10^3 0 10^4a+2b+45 0 10^10 0^inf
+                        rule_step(15, &[("a", "2a+12"), ("b", "0"), ("c", "2a+12")]),
+                        // 0^inf 1100101 B> 10^4a+32 0 10^4a+30 00 10^4a+2b+45 0 10^10 0^inf
+                        rule_step(65, &[("a", "2a+15"), ("b", "2a+14"), ("c", "2a+b+22"), ("d", "8")]),
+                        // 0^inf 1100101 B> 10^4a+36 01100 10^8a+2b+75 0 10^9 0^inf
+                        rule_step(15, &[("a", "2a+16"), ("b", "0"), ("c", "4a+b+37")]),
+                        // 0^inf 1100101 B> 10^4a+40 0 10^8a+2b+80 0 10^6 0^inf
+                        rule_step(10, &[("a", "2a+18"), ("b", "4a+b+39"), ("c", "2"), ("n", "1")]),
+                        // 0^inf 1100101 B> 10^4a+44 0 10^8a+2b+84 0 10^2 0^inf
+                        rule_step(11, &[("a", "2a+21"), ("b", "4a+b+41")]),
+                        // 0^inf 1100101 B> 10^4a+48 01100 10^8a+2b+84 0^inf
+                        rule_step(12, &[("a", "2a+23"), ("b", "0"), ("c", "8a+2b+82")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+47 01100 10^8a+2b+83 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "2a+23"), ("c", "0"), ("d", "8a+2b+81")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+48 01100 10^8a+2b+82 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+12")]),
+                        // 0^inf 1100101 B> 10^4a+56 0 10^4a+54 001100 10^8a+2b+82 0^inf
+                    ]),
+                },
+                // 109: B(a, b, 10)  -->  A(a+10, a+10, 4a+2b+24)
+                Rule {
+                    init_config: b("a", "b", "10"),
+                    final_config: a("a+10", "a+10", "4a+2b+24"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^2b+34 0 10^2 0 10^11 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "b+16"), ("c", "9")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^2b+34 1100 10^10 0^inf
+                        rule_step(81, &[("a", "2a+2"), ("b", "b+16"), ("c", "3")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+7 0 10^2b+35 0 10^9 0 10^4 0^inf
+                        rule_step(48, &[("a", "3"), ("b", "2a+3"), ("c", "b+17"), ("d", "4"), ("e", "3")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+7 0 10^2b+35 0 10^9 0 10^4 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "a+1")]),
+                        // 0^inf 1100101 B> 10^4a+12 0 10^4a+10 0 10^3 0 10^2b+35 0 10^9 0 10^4 0^inf
+                        rule_step(19, &[("a", "2a+4"), ("b", "2a+4"), ("c", "b+17")]),
+                        // 0^inf 1100101 B> 10^4a+16 0 10^4a+14 1100 10^2b+34 0 10^8 0 10^4 0^inf
+                        rule_step(89, &[("a", "2a+7"), ("b", "2a+7"), ("c", "b+15"), ("d", "3")]),
+                        // 0^inf 1100101 B> 10^4a+20 01100 10^4a+2b+47 0 10^13 0^inf
+                        rule_step(15, &[("a", "2a+8"), ("b", "0"), ("c", "2a+b+23")]),
+                        // 0^inf 1100101 B> 10^4a+24 0 10^4a+2b+52 0 10^10 0^inf
+                        rule_step(10, &[("a", "2a+10"), ("b", "2a+b+25"), ("c", "2"), ("n", "2")]),
+                        // 0^inf 1100101 B> 10^4a+32 0 10^4a+2b+60 0 10^2 0^inf
+                        rule_step(11, &[("a", "2a+15"), ("b", "2a+b+29")]),
+                        // 0^inf 1100101 B> 10^4a+36 01100 10^4a+2b+60 0^inf
+                        rule_step(12, &[("a", "2a+17"), ("b", "0"), ("c", "4a+2b+58")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+35 01100 10^4a+2b+59 0^inf
+                        rule_step(13, &[("a", "3"), ("b", "2a+17"), ("c", "0"), ("d", "4a+2b+57")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+36 01100 10^4a+2b+58 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "0"), ("n", "a+9")]),
+                        // 0^inf 1100101 B> 10^4a+44 0 10^4a+42 001100 10^4a+2b+58 0^inf
+                    ]),
+                },
+                // 110: B(a, b, c+11)  -->  B(a+7, 2a+b+13, c)
+                Rule {
+                    init_config: b("a", "b", "c+11"),
+                    final_config: b("a+7", "2a+b+13", "c"),
+                    proof: Proof::Simple(vec![
+                        // 0^inf 1100101 B> 10^4a+4 0 10^2b+34 0 10^2 0 10^c+12 0^inf
+                        rule_step(53, &[("a", "2a+1"), ("b", "b+16"), ("c", "c+10")]),
+                        // 0^inf 1100101 B> 10^4a+8 01100 10^2b+34 1100 10^c+11 0^inf
+                        rule_step(81, &[("a", "2a+2"), ("b", "b+16"), ("c", "c+4")]),
+                        // 0^inf 1100101 B> 10^8 0 10^4a+7 0 10^2b+35 0 10^9 0 10^c+5 0^inf
+                        rule_step(48, &[("a", "3"), ("b", "2a+3"), ("c", "b+17"), ("d", "4"), ("e", "c+4")]),
+                        // 0^inf 1100101 B> 10^8 0 10^6 0 10^4a+7 0 10^2b+35 0 10^9 0 10^c+5 0^inf
+                        rule_step(10, &[("a", "2"), ("b", "2"), ("c", "3"), ("n", "a+1")]),
+                        // 0^inf 1100101 B> 10^4a+12 0 10^4a+10 0 10^3 0 10^2b+35 0 10^9 0 10^c+5 0^inf
+                        rule_step(19, &[("a", "2a+4"), ("b", "2a+4"), ("c", "b+17")]),
+                        // 0^inf 1100101 B> 10^4a+16 0 10^4a+14 1100 10^2b+34 0 10^8 0 10^c+5 0^inf
+                        rule_step(49, &[("a", "2a+7"), ("b", "2a+7"), ("c", "b+15"), ("d", "3"), ("e", "c")]),
+                        // 0^inf 1100101 B> 10^4a+20 01100 10^4a+2b+47 0 10^13 0 10^c+1 0^inf
+                        rule_step(15, &[("a", "2a+8"), ("b", "0"), ("c", "2a+b+23")]),
+                        // 0^inf 1100101 B> 10^4a+24 0 10^4a+2b+52 0 10^10 0 10^c+1 0^inf
+                        rule_step(10, &[("a", "2a+10"), ("b", "2a+b+25"), ("c", "2"), ("n", "2")]),
+                        // 0^inf 1100101 B> 10^4a+32 0 10^4a+2b+60 0 10^2 0 10^c+1 0^inf
                     ]),
                 },
             ],
